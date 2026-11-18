@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycut-image-splitter"
+version = "1.0.0"
+description = "Memory-safe, ultra-fast pure Python + OpenCV + vectorized NumPy image layout parser and batch slicer."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0 OR MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "0passion0" }, { name = "PyCut Contributors" }]
+keywords = [
+  "image-splitting",
+  "computer-vision",
+  "opencv",
+  "numpy",
+  "xy-cut",
+  "layout-analysis",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Graphics",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+  "numpy>=2.0",
+  "opencv-python-headless>=4.10",
+  "pillow>=10.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/0passion0/pycut_splitter"
+Repository = "https://github.com/0passion0/pycut_splitter"
+Issues = "https://github.com/0passion0/pycut_splitter/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "build>=1.2", "twine>=5.0"]
+
+[project.scripts]
+pycut-split = "pycut_splitter.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["python_engine"]
+include = ["pycut_splitter*"]

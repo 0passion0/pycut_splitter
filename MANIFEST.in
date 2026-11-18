@@ -1,0 +1,13 @@
+include LICENSE
+include README.md
+include pyproject.toml
+include MANIFEST.in
+recursive-include python_engine/pycut_splitter *.py
+
+prune src
+prune public
+prune node_modules
+prune .pytest_cache
+prune python_engine/.pytest_cache
+prune python_engine/tests
+global-exclude __pycache__ *.py[cod]

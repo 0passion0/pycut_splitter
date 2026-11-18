@@ -7,7 +7,8 @@ name = "pycut-image-splitter"
 version = "1.0.0"
 description = "Memory-safe, ultra-fast pure Python + OpenCV + vectorized NumPy image layout parser and batch slicer."
 requires-python = ">=3.12"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0 OR MIT"
+authors = [{ name = "0passion0" }, { name = "PyCut Contributors" }]
 dependencies = [
   "numpy>=2.0",
   "opencv-python-headless>=4.10",
