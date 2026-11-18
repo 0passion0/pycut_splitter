@@ -1,0 +1,13 @@
+[
+  "tests/test_pycut.py::test_bento_xycut",
+  "tests/test_pycut.py::test_bleed_decontamination",
+  "tests/test_pycut.py::test_contour_objects",
+  "tests/test_pycut.py::test_core_exports",
+  "tests/test_pycut.py::test_exports_and_parity_alias",
+  "tests/test_pycut.py::test_grid_and_ml_hook_and_split_file",
+  "tests/test_pycut.py::test_memory_safety_and_large_image_low_buffer",
+  "tests/test_pycut.py::test_rgba_transparency_and_low_level_apis",
+  "tests/test_pycut.py::test_sample_slides_2848x1600_real_image",
+  "tests/test_pycut.py::test_uniform_size_modes",
+  "tests/test_pycut.py::test_white_gutter_collage"
+]

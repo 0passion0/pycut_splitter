@@ -1,0 +1,6 @@
+{
+  "name": "PyCut Studio — OpenCV & NumPy High-Speed Image Splitter",
+  "description": "High-performance, memory-safe pure Python + OpenCV + vectorized NumPy image layout parsing, XY-Cut BSP, contour segmentation, and batch slicing workbench.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
