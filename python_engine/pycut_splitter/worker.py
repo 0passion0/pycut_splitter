@@ -1,4 +1,11 @@
-"""Persistent JSON-line IPC worker for PyCut Studio backend."""
+"""
+PyCut Studio 后端持久化 JSON-Lines IPC 工作进程服务模块。
+
+通过标准输入/输出流接收前端分析指令、执行图像切割压测、并快速回传切片数据与元数据。
+
+:author: tongliga
+:date: 2026-11-18
+"""
 
 from __future__ import annotations
 
@@ -13,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-# Ensure python_engine root is importable
+# 确保 python_engine 根目录可被正确定位与导入
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pycut_splitter import SmartSplitter, batch_crop_to_memory_py
@@ -21,6 +28,17 @@ from pycut_splitter.memory_safe import decode_image_safe
 
 
 def _decode_b64_image(b64_data: str) -> np.ndarray:
+    """
+    将前端传入的 Base64 字符串（支持可选的 data URI 前缀）解码为 RGB/RGBA 图像数组。
+
+    :param b64_data: 包含图像二进制内容的 Base64 编码字符串。
+    :type b64_data: str
+    :return: 标准化为 RGB 或 RGBA 通道顺序的 uint8 类型 NumPy 图像矩阵。
+    :raises ValueError: 当输入字节无法被解码为有效图像时抛出。
+    :author: tongliga
+    :date: 2026-11-18
+    """
+    # 剥离可能存在的 Data URL 前缀（如 'data:image/png;base64,'）
     if "," in b64_data and b64_data.startswith("data:"):
         b64_data = b64_data.split(",", 1)[1]
     raw = np.frombuffer(base64.b64decode(b64_data), dtype=np.uint8)
@@ -35,6 +53,15 @@ def _decode_b64_image(b64_data: str) -> np.ndarray:
 
 
 def _generate_synthetic_preset(name: str) -> np.ndarray:
+    """
+    根据预设名称在内存中生成合成基准测试图像（用于快速回归与性能对比）。
+
+    :param name: 预设名称，支持 "bento"、"gutters"、"large_4k" 或默认 "contours"。
+    :type name: str
+    :return: 绘制有特定几何块与文字标头的合成图像 RGB 数组。
+    :author: tongliga
+    :date: 2026-11-18
+    """
     if name == "bento":
         img = np.full((800, 1200, 3), 255, dtype=np.uint8)
         cv2.rectangle(img, (0, 0), (594, 800), (24, 52, 110), -1)
@@ -59,7 +86,7 @@ def _generate_synthetic_preset(name: str) -> np.ndarray:
         return img
 
     if name == "large_4k":
-        # 3840x2160 4K 12-card stress-test collage with subtle 1px hairlines
+        # 3840x2160 4K 12 格极限压测合成拼图（含 1px 细微发丝缝隙）
         img = np.full((2160, 3840, 3), 248, dtype=np.uint8)
         palette = [
             (24, 52, 110), (15, 118, 110), (185, 28, 28), (30, 64, 175),
@@ -89,7 +116,7 @@ def _generate_synthetic_preset(name: str) -> np.ndarray:
                 idx += 1
         return img
 
-    # Default: contours
+    # 默认：多重离散轮廓物体图形
     img = np.full((950, 1500, 3), 248, dtype=np.uint8)
     blobs = [
         (80, 70, 400, 350, (29, 78, 216), "Object #1"),
@@ -105,6 +132,17 @@ def _generate_synthetic_preset(name: str) -> np.ndarray:
 
 
 def _handle_analyze(req: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    处理 IPC 接收到的 analyze 分析与切片请求载荷。
+
+    :param req: 包含图像源、切割模式与参数的请求字典。
+    :type req: Dict[str, Any]
+    :return: 包含宽高、耗时、检测框与切片 Base64 数据的响应字典。
+    :raises ValueError: 当请求中既无 imageBase64、imagePath 也无 preset 预设名称时抛出。
+    :author: tongliga
+    :date: 2026-11-18
+    """
+    # 第一步：根据请求源解析输入图像为标准 NumPy 矩阵
     preset = req.get("preset")
     image_b64 = req.get("imageBase64")
     image_path = req.get("imagePath")
@@ -118,6 +156,7 @@ def _handle_analyze(req: Dict[str, Any]) -> Dict[str, Any]:
     else:
         raise ValueError("Missing imageBase64, imagePath, or preset")
 
+    # 第二步：构造 SmartSplitter 实例并初始化几何与规格化参数
     target_w = req.get("targetWidth")
     target_h = req.get("targetHeight")
     target_size: Optional[Tuple[int, int]] = None
@@ -140,11 +179,13 @@ def _handle_analyze(req: Dict[str, Any]) -> Dict[str, Any]:
     gutter_px = int(req.get("gutterPx", 0))
     fmt = str(req.get("format", "png"))
 
+    # 第三步：运行版面分析并统计耗时
     t0 = time.perf_counter()
     res = splitter.analyze(img, rows=rows, cols=cols, gutter_px=gutter_px, collect_diagnostics=True)
     analyze_ms = (time.perf_counter() - t0) * 1000.0
     raw_mb = img.nbytes / (1024.0 * 1024.0)
 
+    # 第四步：若前端要求回传切片数据，执行内存并发裁剪与 Data URI 编码
     tiles_b64: List[Dict[str, Any]] = []
     encode_ms = 0.0
     if res.boxes and req.get("includeTiles", True):
@@ -173,9 +214,9 @@ def _handle_analyze(req: Dict[str, Any]) -> Dict[str, Any]:
                 }
             )
 
+    # 第五步：处理轻量原图缩略图用于前端快速首屏展示
     source_preview_url: Optional[str] = None
     if req.get("includeSourcePreview", False):
-        # Downscale preview only if >1920px wide for fast UI transport; analysis ran at 100% 1:1 resolution
         h, w = img.shape[:2]
         if w > 1920:
             scale = 1920.0 / float(w)
@@ -218,6 +259,13 @@ def _handle_analyze(req: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_benchmark() -> Dict[str, Any]:
+    """
+    运行内置的多场景标准分辨率基准测试套件，评测吞吐率与瞬时内存峰值。
+
+    :return: 包含 OpenCV 与 NumPy 版本号以及各压测用例性能明细的汇总字典。
+    :author: tongliga
+    :date: 2026-11-18
+    """
     cases = [
         ("1080p Bento 拼图 (1920x1080)", 1920, 1080, "xycut", 3, 2),
         ("2.8K 幻灯片集 (2848x1600)", 2848, 1600, "xycut", 3, 3),
@@ -230,7 +278,7 @@ def _handle_benchmark() -> Dict[str, Any]:
     splitter_auto = SmartSplitter(mode="auto", sensitivity=0.65, bleed_trim=2)
     splitter_ct = SmartSplitter(mode="contour", sensitivity=0.70, contour_gap_px=8)
 
-    # Warm up OpenCV SIMD / NumPy kernel caches once before timing
+    # 预热 OpenCV SIMD 与 NumPy 矩阵核
     _warmup_img = np.full((64, 64, 3), 240, dtype=np.uint8)
     _warmup_img[10:54, 10:54] = (40, 80, 160)
     splitter_xy.analyze(_warmup_img)
@@ -252,7 +300,6 @@ def _handle_benchmark() -> Dict[str, Any]:
 
         sp = splitter_ct if mode == "contour" else (splitter_auto if mode == "auto" else splitter_xy)
 
-        # Warmup once on 1st case or measure pure SIMD latency without tracemalloc overhead
         t0 = time.perf_counter()
         res = sp.analyze(img)
         analyze_ms = (time.perf_counter() - t0) * 1000.0
@@ -294,7 +341,13 @@ def _handle_benchmark() -> Dict[str, Any]:
 
 
 def main() -> None:
-    # Signal readiness to parent Node process
+    """
+    IPC 工作进程的主循环入口，从标准输入逐行读取 JSON 指令并将处理结果写入标准输出。
+
+    :author: tongliga
+    :date: 2026-11-18
+    """
+    # 向父进程宣告就绪状态与基础环境版本
     sys.stdout.write(json.dumps({"ready": True, "cv2": cv2.__version__, "numpy": np.__version__}) + "\n")
     sys.stdout.flush()
 

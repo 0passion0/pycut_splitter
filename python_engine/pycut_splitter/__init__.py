@@ -1,4 +1,11 @@
-"""PyCut Image Splitter: pure Python + OpenCV + vectorized NumPy engine."""
+"""
+PyCut Image Splitter 纯 Python + OpenCV SIMD + 向量化 NumPy 核心模块。
+
+提供具备工业级内存安全守卫、极速吞吐、零拷贝视口切片与多策略自适应智能切图能力。
+
+:author: tongliga
+:date: 2026-11-18
+"""
 
 from .algorithms import (
     batch_crop_and_save_py,
