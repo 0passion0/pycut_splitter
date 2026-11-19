@@ -28,7 +28,12 @@ class PythonWorkerPool {
     }
 
     this.readyPromise = new Promise<void>((resolveReady, rejectReady) => {
-      const pyBin = fs.existsSync('/opt/py312/bin/python') ? '/opt/py312/bin/python' : 'python3.12';
+      const venvPy = path.resolve(__dirname, '.venv', 'bin', 'python');
+      const pyBin = fs.existsSync(venvPy)
+        ? venvPy
+        : fs.existsSync('/opt/py312/bin/python')
+          ? '/opt/py312/bin/python'
+          : 'python3.12';
       const child = spawn(pyBin, ['-u', WORKER_SCRIPT], {
         cwd: __dirname,
         env: { ...process.env, PYTHONUNBUFFERED: '1' },

@@ -13,6 +13,7 @@ import argparse
 from pathlib import Path
 from typing import Optional, Tuple
 
+from . import __version__
 from .engine import HAS_OPENCV_CORE, SmartSplitter
 
 
@@ -53,6 +54,7 @@ def main() -> None:
         prog="pycut-split",
         description="Memory-safe, vectorized OpenCV + NumPy composite image splitter.",
     )
+    parser.add_argument("-V", "--version", action="version", version=f"pycut-split {__version__}")
     parser.add_argument("input", type=Path, help="Input image path or directory of images")
     parser.add_argument("-o", "--output", type=Path, default=Path("./output_slices"), help="Output directory")
     parser.add_argument(
@@ -101,7 +103,7 @@ def main() -> None:
     )
 
     # 第四步：循环处理每张图像并输出控制台汇总信息
-    print(f"PyCut Splitter v1.0.0 | OpenCV+NumPy SIMD Core: {'ACTIVE' if HAS_OPENCV_CORE else 'INACTIVE'}")
+    print(f"PyCut Splitter v{__version__} | OpenCV+NumPy SIMD Core: {'ACTIVE' if HAS_OPENCV_CORE else 'INACTIVE'}")
     for img_path in inputs:
         sub_out = args.output / img_path.stem if args.input.is_dir() else args.output
         result, saved = splitter.split_file(

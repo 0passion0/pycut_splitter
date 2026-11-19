@@ -347,6 +347,10 @@ def main() -> None:
     :author: tongliga
     :date: 2026-11-18
     """
+    # 在独立工作进程内禁用 OpenCV 内部细粒度线程池，消除小条带算子的线程调度抖动，
+    # 同时避免与批量编码阶段的 ThreadPoolExecutor 产生线程超配竞争
+    cv2.setNumThreads(1)
+
     # 向父进程宣告就绪状态与基础环境版本
     sys.stdout.write(json.dumps({"ready": True, "cv2": cv2.__version__, "numpy": np.__version__}) + "\n")
     sys.stdout.flush()

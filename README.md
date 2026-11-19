@@ -26,11 +26,11 @@
 
 ## 1. 核心能力与内存优化亮点
 
-- **全向量化 OpenCV + NumPy 内核**：核心投影、边缘能量计算与形态学提取完全基于 OpenCV C++ 底层算子（`cv2.absdiff`、`cv2.addWeighted`、`cv2.dilate`、`cv2.connectedComponentsWithStats`）与 NumPy `uint8` / `uint16` 运算，零 Python 像素循环。
-- **分条（Strip-Chunked）低内存架构**：按 `1024` 行分块扫描图像背景差值与边界梯度能量，及时释放临时切片缓冲，避免创建全图 `float32` / `int16` 副本；在 **8K（7680×4320，94.92 MB 原图）** 压测下峰值瞬态缓冲仅约 **21 MB（22.1%）**。
-- **方向步进 + 1px 细线接缝能量检测**：结合 `C^2.4` 非线性覆盖率抑制与切向平滑度过滤，避免图表、文字段落与表格内部出现误切。
-- **谷底折叠与递归 XY-Cut BSP**：自动识别背景留白沟槽（Gutter）并折叠中点，配合 **±12px 兄弟网格线传播**，稳健应对未对齐网格、非对称 Bento 拼图以及浅白细线分隔。
-- **±8px 阶跃吸附与边缘去污染（`bleed_trim`）**：对分割边界进行局部能量极大值吸附，并向内剥离抗锯齿残影与 `1px` 灰边。
+- **全向量化 OpenCV SIMD + NumPy 内核**：核心投影、双通道均衡感知色差（`RGB2GRAY`/`BGR2GRAY max`）、`INTER_NEAREST` 零模糊条带采样与形态学提取完全基于 OpenCV C++ 底层算子（`cv2.absdiff`、`cv2.reduce`、`cv2.addWeighted`、`cv2.dilate`、`cv2.connectedComponents`）与 `uint8` 空间运算，零 Python 像素循环。
+- **分条（Strip-Chunked）低内存架构**：仅提取紧凑采样条带计算背景差值与边界梯度能量，及时释放临时缓冲，避免创建全图 `float32` / `int16` 副本；在 **8K（7680×4320，94.92 MB 原图）** 压测下解析耗时仅 **`150.9 ms`（219.8 MP/s）**，峰值瞬态缓冲仅 **`19.18 MB（20.2%）`**。
+- **抗噪背景估计与方向步进 + 1px 细线能量检测**：采用四周 2px 环带采样 + 软 L1 内点投票抵抗 1px 截图黑边与 JPEG 压缩噪声；结合 `C^2.4` 非线性覆盖率抑制与抗异常值截断切向平滑度过滤，避免误切幻灯片表格标题栏与文字段落。
+- **谷底折叠与按边独立沟槽的递归 XY-Cut BSP**：按四边独立跟踪空白沟槽（Gutter）并折叠中点，结合覆盖率加权轴向仲裁保护通高 Bento 列，配合 **完整多轮 ±12px 兄弟网格线传播**，稳健应对未对齐大型网格、非对称 Bento 拼图及浅白细线分隔。
+- **覆盖率门控 ±8px 吸附与纹理感知去污染（`bleed_trim`）**：对非沟槽边界执行带距离先验衰减的局部能量极大值吸附，并向量化向内剥离抗锯齿残影与 `1px` 灰边。
 - **零拷贝 ROI 裁切与多线程并发编码**：基于 NumPy 切片视图截取子图，通过 `ThreadPoolExecutor` 释放 GIL 并发执行 `cv2.imencode`（支持 `PNG` / `JPG` / `WebP` 及 Alpha 透明通道保留），并内置 `pad` / `resize` / `crop` 统一输出尺寸。
 - **严格内存安全护栏（`memory_safe.py`）**：内建解压缩炸弹像素上限保护（默认 `256 MP`）、数组维度与 `dtype` 校验、边界坐标安全钳位（`clamp_box`）以及只读零拷贝 ROI 校验。
 
@@ -148,7 +148,7 @@ pycut-split public/examples/sample_slides.png -o ./slices --mode auto --format p
 本项目同时内置基于 **Express + Python 3.12 持久化 IPC Worker + React** 的 **PyCut Studio** 交互式工作台，可实时调节参数、检查像素边缘并运行 1080p–8K 实时基准压测。
 
 ```bash
-# 运行 Python 单元测试与 4K 内存安全压测（10 项测试）
+# 运行 Python 单元测试与算法稳定性/内存安全回归测试（17 项测试）
 pytest -v python_engine/tests/test_pycut.py
 
 # 构建 wheel 与 sdist 并检查分发规范

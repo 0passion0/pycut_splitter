@@ -26,11 +26,11 @@ A memory-safe, ultra-fast **Python 3.12 + OpenCV SIMD + vectorized NumPy** compo
 
 ## 1. Highlights & Memory-Safety Architecture
 
-- **Pure Python 3.12 + OpenCV SIMD / NumPy Kernels**: Seam projections, morphological closing, and connected-component labeling execute directly on OpenCV C++ operators (`cv2.absdiff`, `cv2.addWeighted`, `cv2.dilate`, `cv2.connectedComponentsWithStats`) and vectorized `uint8`/`uint16` arrays.
-- **Strip-Chunked Low-Memory Design**: Scans 1024-row strips to avoid allocating full-image `float32`/`int16` copies—keeping peak transient buffer allocation around **21 MB (22.1%)** on an **8K (7680×4320, 94.92 MB)** test canvas.
-- **Directional Step + `1px` Hairline Seam Energy**: Combines `C^2.4` coverage weighting and tangential smoothness penalties to cut clean panel borders without slicing through internal charts, text, or tables.
-- **Gutter Collapsing & Recursive XY-Cut BSP**: Collapses wide gutters to midpoints and uses **`±12px` sibling grid-line propagation** to handle misaligned rows, asymmetric Bento layouts, and faint white-on-white dividers.
-- **±8px Discontinuity Snap & `bleed_trim`**: Snaps panel edges locally and peels outer anti-aliased edge bleed or `1px` dividers.
+- **Pure Python 3.12 + OpenCV SIMD / NumPy Kernels**: Seam projections, balanced uint8 RGB/BGR channel diffs, `INTER_NEAREST` zero-blur strip sampling, and morphological extraction execute directly on OpenCV C++ operators (`cv2.absdiff`, `cv2.reduce`, `cv2.addWeighted`, `cv2.dilate`, `cv2.connectedComponents`) with zero Python pixel loops.
+- **Strip-Chunked Low-Memory Design**: Extracts compact strips to avoid full-image `float32`/`int16` copies—achieving **`150.9 ms` (219.8 MP/s)** parse time and **`19.18 MB` (20.2%)** peak transient buffer on an **8K (7680×4320, 94.92 MB)** test canvas.
+- **Noise-Resilient Background & `1px` Hairline Seam Energy**: Uses 2px perimeter ring sampling + soft L1 inlier voting to resist 1px dark bezels and JPEG noise, combined with `C^2.4` coverage weighting and outlier-clipped tangential smoothness to avoid slicing internal slide headers or tables.
+- **Per-Edge Gutter Tracking & Multi-Pass Recursive XY-Cut BSP**: Tracks gutter edges independently per side, uses coverage-weighted axis arbitration to protect full-height Bento columns, and runs **full multi-pass `±12px` sibling grid-line propagation** across large grids.
+- **Coverage-Gated `±8px` Snap & Texture-Aware `bleed_trim`**: Snaps non-gutter edges with distance-prior decay and peels anti-aliased edge bleed or `1px` dividers via vectorized strip scans.
 - **Zero-Copy ROI Views & GIL-Free Parallel Encoding**: Slices NumPy views and encodes PNG / JPG / WebP concurrently via `ThreadPoolExecutor` (`cv2.imencode`), with optional uniform output sizing (`pad` / `resize` / `crop`).
 - **Strict Memory Guardrails (`memory_safe.py`)**: Built-in decompression-bomb pixel ceiling (`256 MP` default), array shape/dtype validation, safe coordinate clamping (`clamp_box`), and read-only zero-copy checks.
 
