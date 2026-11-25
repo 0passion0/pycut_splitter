@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pycut-image-splitter"
-version = "1.1.0"
+version = "1.2.0"
 description = "Memory-safe, ultra-fast pure Python + OpenCV + vectorized NumPy image layout parser and batch slicer."
 requires-python = ">=3.12"
 license = "Apache-2.0 OR MIT"

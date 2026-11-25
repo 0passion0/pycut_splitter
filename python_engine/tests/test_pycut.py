@@ -26,7 +26,7 @@ from pycut_splitter import (
 
 def test_core_exports():
     assert HAS_OPENCV_CORE is True
-    assert __version__ == "1.1.0"
+    assert __version__ == "1.2.0"
     assert callable(SmartSplitter)
 
 
@@ -372,3 +372,90 @@ def test_staggered_height_reading_order_stability():
     assert res.boxes[0].x < res.boxes[1].x < res.boxes[2].x
     assert res.boxes[3].x < res.boxes[4].x < res.boxes[5].x
 
+
+def test_real_uploaded_slide_decks_white_seams_and_split_screen():
+    """Verify LUT + 1D prominence + BSP size/aspect regularization cleanly slice 9/9 slides across sensitivity sweeps."""
+    root_assets = Path(__file__).resolve().parent.parent.parent / "public" / "assets" / "aistudio"
+    healthcare_path = root_assets / "bd30a154-cfe4-42d8-bd4f-d25eb6dd044a_c6ab570a.png"
+    bluebird_path = root_assets / "9725e7ed-c93f-42e4-a57c-8e4d219622bd_d374a3d5.png"
+    if not healthcare_path.exists() or not bluebird_path.exists():
+        pytest.skip("Uploaded sample assets not present")
+
+    with Image.open(healthcare_path) as im1:
+        arr1 = np.asarray(im1.convert("RGB"), dtype=np.uint8)
+    with Image.open(bluebird_path) as im2:
+        arr2 = np.asarray(im2.convert("RGB"), dtype=np.uint8)
+
+    for sens in (0.35, 0.65, 0.85):
+        res1 = SmartSplitter(mode="auto", sensitivity=sens, bleed_trim=2).analyze(arr1)
+        assert len(res1.boxes) == 9, f"Healthcare deck s={sens}: expected 9, got {len(res1.boxes)}"
+        for b in res1.boxes:
+            assert 940 <= b.width <= 956
+            assert 528 <= b.height <= 538
+
+        res2 = SmartSplitter(mode="auto", sensitivity=sens, bleed_trim=2).analyze(arr2)
+        assert len(res2.boxes) == 9, f"Bluebird deck s={sens}: expected 9, got {len(res2.boxes)}"
+        for b in res2.boxes:
+            assert 940 <= b.width <= 956
+            assert 502 <= b.height <= 564
+
+
+def test_split_screen_and_three_column_internal_infographic_slides():
+    """Slide deck with subtle near-white boundaries plus internal split-screen & 3-stripe content must yield 9/9 tiles."""
+    sheet = np.full((1200, 1800, 3), 252, dtype=np.uint8)
+    tones = [
+        [(252, 253, 255), (245, 248, 252), (254, 251, 249)],
+        [(246, 249, 253), (253, 253, 255), (244, 247, 251)],
+        [(254, 252, 250), (246, 249, 252), (252, 254, 253)],
+    ]
+    for r in range(3):
+        for c in range(3):
+            y0, y1 = r * 400, (r + 1) * 400
+            x0, x1 = c * 600, (c + 1) * 600
+            sheet[y0:y1, x0:x1] = tones[r][c]
+            # Place a clean title block & footer badge inside each slide
+            sheet[y0 + 36 : y0 + 76, x0 + 40 : x0 + 280] = (24, 58, 120)
+            sheet[y0 + 110 : y0 + 280, x0 + 48 : x0 + 320] = (90, 145, 210)
+    # Slide (0, 2): full-height half-width dark split-screen hero block
+    sheet[0:400, 1200:1470] = (18, 46, 98)
+    # Slide (1, 1): full-height 3-column internal infographic strips
+    sheet[400:800, 600:800] = (28, 65, 130)
+    sheet[400:800, 800:1000] = (220, 232, 246)
+    sheet[400:800, 1000:1200] = (42, 135, 110)
+
+    buf = BytesIO()
+    Image.fromarray(sheet).save(buf, format="JPEG", quality=75)
+    buf.seek(0)
+    arr = np.asarray(Image.open(buf).convert("RGB"), dtype=np.uint8)
+
+    res = SmartSplitter(mode="auto", sensitivity=0.65, bleed_trim=2).analyze(arr)
+    assert len(res.boxes) == 9, f"Expected 9 intact slides, got {len(res.boxes)}"
+    for b in res.boxes:
+        assert 592 <= b.width <= 606
+        assert 392 <= b.height <= 406
+
+
+def test_pure_white_hairline_divided_slide_deck():
+    """Pure #FFFFFF slide deck divided by 1px hairlines with internal slide padding must keep all 9 intact slides."""
+    pw = np.full((1200, 1800, 3), 255, dtype=np.uint8)
+    for r in range(3):
+        for c in range(3):
+            y0, x0 = r * 400, c * 600
+            pw[y0 + 40 : y0 + 82, x0 + 42 : x0 + 300] = (24, 58, 120)
+            pw[y0 + 115 : y0 + 290, x0 + 48 : x0 + 340] = (90, 145, 210)
+            pw[y0 + 330 : y0 + 355, x0 + 42 : x0 + 180] = (140, 155, 175)
+    # Full-height split-screen and 3-column infographic internals
+    pw[0:400, 1200:1470] = (18, 46, 98)
+    pw[400:800, 600:800] = (28, 65, 130)
+    pw[400:800, 800:1000] = (225, 236, 248)
+    pw[400:800, 1000:1200] = (42, 135, 110)
+    for k in (1, 2):
+        pw[k * 400, :] = (210, 216, 224)
+        pw[:, k * 600] = (210, 216, 224)
+
+    for sens in (0.35, 0.65, 0.85):
+        res = SmartSplitter(mode="auto", sensitivity=sens, bleed_trim=2).analyze(pw)
+        assert len(res.boxes) == 9, f"Pure white deck s={sens}: expected 9, got {len(res.boxes)}"
+        for b in res.boxes:
+            assert 594 <= b.width <= 604
+            assert 394 <= b.height <= 404

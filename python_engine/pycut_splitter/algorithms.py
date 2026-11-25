@@ -4,11 +4,13 @@ PyCut 图像切割引擎的向量化 OpenCV + NumPy 核心算法模块。
 高性能与高稳定性架构特性：
 - 零拷贝步长跨度条带提取（仅 O(span * 200) 瞬态内存开销）
 - OpenCV C++ SIMD 双通道均衡色差（RGB2GRAY / BGR2GRAY max，uint8 空间 8x 加速与 50% 内存缩减）
+- OpenCV C++ SIMD `cv2.LUT` 韦伯感知对数对比度压缩 + 1D 局部突出度（Prominence）脉冲信噪比增强
 - OpenCV C++ SIMD cv2.reduce 轴向均值归约（较 NumPy 轴向求和提速 3.5x~31x）
 - 多环边框采样 + 软内点一致性背景估计（抗 1px 截图黑边与 JPEG 量化边界噪声）
 - 按边独立跟踪沟槽属性（per-edge gutter flags），消除混合沟槽与细线场景的吸附冲突
 - 覆盖率门控 + 距离先验的 ±8px 边缘吸附与纹理感知型去渗色（bleed_trim）修边
-- 完整多轮同级兄弟割线对齐传播（±12px 低阈值召回，突破单轮 3 次上限）
+- 完整多轮同级兄弟割线对齐传播（±12px 突显度召回，支持同轴子树展平）
+- 基于全盘尺寸共识与长宽比一致性的自底向上 BSP 几何正则化（消除卡片/幻灯片内部插图误切）
 - 噪声自适应、精确间隙半径、防嵌套重复框与向量化 1:1 收紧的轮廓提取算子
 - 基于纵向重叠率的视觉行聚类阅读顺序重排与释放 GIL 的多线程并发编码导出
 
@@ -18,9 +20,10 @@ PyCut 图像切割引擎的向量化 OpenCV + NumPy 核心算法模块。
 
 from __future__ import annotations
 
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -33,6 +36,27 @@ _KERNEL_5x1 = np.ones((5, 1), dtype=np.uint8)
 _KERNEL_1x5 = np.ones((1, 5), dtype=np.uint8)
 _KERNEL_3x1 = np.ones((3, 1), dtype=np.uint8)
 _KERNEL_1x3 = np.ones((1, 3), dtype=np.uint8)
+
+
+def _build_seam_lut() -> np.ndarray:
+    """
+    预计算用于 OpenCV C++ SIMD `cv2.LUT` 的亚线性韦伯对数感知对比度查找表。
+
+    抑制微小量化抖动（<=1）的同时，对浅色微弱拼接边缘（2..15）给予非线性提权，
+    防止高对比度内部插图/摄影区块以线性幅度压制全贯通真实面板割线。
+
+    :return: 长度为 256 的 uint8 查找表数组。
+    :author: tongliga
+    :date: 2026-11-25
+    """
+    x = np.arange(256, dtype=np.float32)
+    lut = np.zeros(256, dtype=np.uint8)
+    mask = x > 1.0
+    lut[mask] = np.clip(np.rint(26.0 * np.log1p((x[mask] - 1.0) * 0.45)), 0, 255).astype(np.uint8)
+    return lut
+
+
+_SEAM_LUT = _build_seam_lut()
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -209,6 +233,7 @@ class _SeamProfile:
     scores: np.ndarray
     coverage: np.ndarray
     is_gutter: np.ndarray
+    is_hairline_sheet: bool = False
 
 
 @dataclass(slots=True)
@@ -240,6 +265,67 @@ class _RawRegion:
         :date: 2026-11-18
         """
         return self.gutter_top or self.gutter_right or self.gutter_bottom or self.gutter_left
+
+
+@dataclass(slots=True)
+class _BspNode:
+    """
+    表示递归 XY-Cut 二叉/多叉空间分割树节点的层次数据结构。
+
+    显式保存每一层级的切割轴向、割线列表（含沟槽标记与得分）及子树集合，
+    支持同轴展平、邻居割线传播挂载及自底向上几何尺度正则化剪枝。
+
+    :author: tongliga
+    :date: 2026-11-25
+    """
+
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    conf: float
+    gutter_top: bool = False
+    gutter_right: bool = False
+    gutter_bottom: bool = False
+    gutter_left: bool = False
+    axis: Optional[str] = None
+    cuts: List[Tuple[int, float, float, bool]] = field(default_factory=list)
+    children: List["_BspNode"] = field(default_factory=list)
+
+    def collect_leaves(self) -> List["_BspNode"]:
+        """
+        收集当前节点子树下按从前到后顺序排列的全部叶子节点。
+
+        :return: 当前子树的叶子 `_BspNode` 列表。
+        :author: tongliga
+        :date: 2026-11-25
+        """
+        if not self.children:
+            return [self]
+        res: List[_BspNode] = []
+        for child in self.children:
+            res.extend(child.collect_leaves())
+        return res
+
+    def to_raw_region(self) -> _RawRegion:
+        """
+        将叶子 BSP 节点转换为包含四边独立沟槽标记的 `_RawRegion` 对象。
+
+        :return: 对应的 `_RawRegion` 实例。
+        :author: tongliga
+        :date: 2026-11-25
+        """
+        return _RawRegion(
+            self.x0,
+            self.y0,
+            self.x1,
+            self.y1,
+            self.conf,
+            self.gutter_top,
+            self.gutter_right,
+            self.gutter_bottom,
+            self.gutter_left,
+        )
 
 
 def _estimate_border_bg_stats(img: np.ndarray) -> Tuple[np.ndarray, bool, float, float]:
@@ -282,14 +368,17 @@ def _estimate_border_bg_stats(img: np.ndarray) -> Tuple[np.ndarray, bool, float,
     seed_mask = keys == best_key
     seed_rgb = np.median(rgb[seed_mask], axis=0).astype(np.int16)
 
-    # 第四步：围绕种子色执行软 L1 内点共识聚合，解决 JPEG 量化跨箱分裂问题
+    # 第四步：围绕种子色执行软 L1 内点共识聚合，并基于紧邻主众数子集估算高频噪声 MAD
     l1_dist = np.abs(rgb - seed_rgb).sum(axis=1)
     inliers = l1_dist <= 24
     inlier_cnt = max(1, int(np.count_nonzero(inliers)))
     inlier_rgb = rgb[inliers]
     mean_rgb = np.rint(inlier_rgb.mean(axis=0)).clip(0, 255).astype(np.uint8)
-    # 估算单通道等效背景噪声 MAD（0..255 尺度）
-    bg_noise_mad = float(np.abs(inlier_rgb - mean_rgb.astype(np.int16)).mean())
+    # 仅在紧邻众数（|rgb - seed|_1 <= 9）内点上估计高频噪声 MAD，避免多色浅底拼接板误拉高噪声阈值
+    tight_mask = l1_dist <= 9
+    noise_rgb = rgb[tight_mask] if int(np.count_nonzero(tight_mask)) >= 8 else inlier_rgb
+    tight_mean = np.rint(noise_rgb.mean(axis=0)).clip(0, 255).astype(np.int16)
+    bg_noise_mad = float(np.abs(noise_rgb - tight_mean).mean())
 
     bg_rgba = np.array([int(mean_rgb[0]), int(mean_rgb[1]), int(mean_rgb[2]), 255], dtype=np.uint8)
     uniformity = float(inlier_cnt) / float(n)
@@ -308,6 +397,116 @@ def estimate_border_bg(img: np.ndarray) -> Tuple[np.ndarray, bool, float]:
     """
     bg_rgba, is_trans, uniformity, _ = _estimate_border_bg_stats(img)
     return bg_rgba, is_trans, uniformity
+
+
+def _validate_gutter_mask(
+    g_mask: np.ndarray,
+    bg_frac_full: np.ndarray,
+    seam_inner: np.ndarray,
+    cov_inner: np.ndarray,
+    threshold: float,
+    min_dim: int,
+    allow_sparse_gutter: bool,
+) -> np.ndarray:
+    """
+    从候选背景沟槽掩模中甄别真正的卡片间隔沟槽与白底幻灯片/文章内部的留白边距。
+
+    甄别遵循三项图像布局拓扑几何原则：
+    1. 双侧前景密度一致性：真实拼图沟槽两侧紧邻区域应存在实质前景实体（bg_frac 较低），而非单侧或双侧大面积留白；
+    2. 锐利缝隙优先原则：若留白区一侧或内部紧邻全跨度高覆盖率非沟槽分割线（如 1px 细线或浅色底板接缝），
+       或者在稀疏留白附近存在竞争性锐利面板边界，则该留白属于面板内边距而非独立卡片沟槽，应抑制以免遮蔽真接缝；
+    3. 宽幅留白守卫：超出常规沟槽宽度的超大留白区域若紧邻接缝且非双侧致密前景包裹，一律判为面板留白。
+
+    :param g_mask: 初步由平坦度与背景占比筛选出的内部沟槽布尔掩模。
+    :type g_mask: numpy.ndarray
+    :param bg_frac_full: 包含首尾边界的逐行/列背景占比数组。
+    :type bg_frac_full: numpy.ndarray
+    :param seam_inner: 对应内区间的锐利非沟槽缝隙评分数组。
+    :type seam_inner: numpy.ndarray
+    :param cov_inner: 对应内区间的精细覆盖率数组。
+    :type cov_inner: numpy.ndarray
+    :param threshold: 当前割线入选的能量阈值。
+    :type threshold: float
+    :param min_dim: 最小子块避让尺寸。
+    :type min_dim: int
+    :param allow_sparse_gutter: 是否允许在稀疏前景条件下保留窄幅独立沟槽（顶层或外缘已切沟槽区域）。
+    :type allow_sparse_gutter: bool
+    :return: 二元组 ``(validated_g_mask, is_hairline_sheet)``。
+    :author: tongliga
+    :date: 2026-11-25
+    """
+    n_inner = seam_inner.size
+    n_full = bg_frac_full.size
+    sharp_seam = (seam_inner >= threshold) & (cov_inner >= 0.72)
+    # 若条带中存在双侧均为高背景留白（>0.65）的锋利 1~3px 分隔细线，说明当前为白底无缝分栏面板而非浮岛拼图，抑制内部留白误切
+    sharp_indices = np.flatnonzero(sharp_seam)
+    is_hairline_sheet = False
+    for p_np in sharp_indices:
+        p = int(p_np)
+        far_l = bg_frac_full[max(0, p - 10) : max(0, p)]
+        far_r = bg_frac_full[min(n_full, p + 3) : min(n_full, p + 13)]
+        if far_l.size > 0 and far_r.size > 0 and float(far_l.mean()) > 0.65 and float(far_r.mean()) > 0.65:
+            is_hairline_sheet = True
+            break
+
+    if is_hairline_sheet or not np.any(g_mask):
+        return np.zeros_like(g_mask, dtype=bool), is_hairline_sheet
+
+    validated = g_mask.copy()
+    padded = np.empty(n_inner + 2, dtype=np.int8)
+    padded[0] = 0
+    padded[-1] = 0
+    padded[1:-1] = g_mask
+    diffs = np.diff(padded)
+    starts = np.flatnonzero(diffs == 1)
+    ends = np.flatnonzero(diffs == -1) - 1
+
+    max_sparse_width = max(72, int(round(n_inner * 0.12)))
+
+    for s_idx_np, e_idx_np in zip(starts, ends):
+        s_idx = int(s_idx_np)
+        e_idx = int(e_idx_np)
+        run_len = e_idx - s_idx + 1
+
+        # 注意：seam_inner[k] 与 bg_frac_full[k + 1] 一一对应
+        fl_end = min(n_full, s_idx + 2)
+        fl_start = max(0, fl_end - 12)
+        fr_start = min(n_full, e_idx + 2)
+        fr_end = min(n_full, fr_start + 12)
+
+        bg_l_min = float(bg_frac_full[fl_start:fl_end].min()) if fl_end > fl_start else 1.0
+        bg_r_min = float(bg_frac_full[fr_start:fr_end].min()) if fr_end > fr_start else 1.0
+        max_flank_bg = max(bg_l_min, bg_r_min)
+
+        # 双侧均为致密前景实体（<=0.45 背景占比）：检查边界是否仅为白底细线分隔伪影
+        if max_flank_bg <= 0.45:
+            # 确认边缘处的强锋利细线不是两侧均为高背景（>0.70）的 1px 隔断线
+            edge_lo = max(0, s_idx - 3)
+            edge_hi = min(n_inner, e_idx + 4)
+            local_sharp = np.flatnonzero(sharp_seam[edge_lo:edge_hi])
+            for rel_p in local_sharp:
+                p = edge_lo + int(rel_p)
+                far_l = bg_frac_full[max(0, p - 10) : max(0, p)]
+                far_r = bg_frac_full[min(n_full, p + 3) : min(n_full, p + 13)]
+                if far_l.size > 0 and far_r.size > 0 and float(far_l.mean()) > 0.70 and float(far_r.mean()) > 0.70:
+                    validated[s_idx : e_idx + 1] = False
+                    break
+            continue
+
+        # 单侧或双侧留白较多（max_flank_bg > 0.45）：严格校验是否真正无边界冲突且为窄沟槽
+        if (not allow_sparse_gutter) or max_flank_bg > 0.72 or run_len > max_sparse_width:
+            validated[s_idx : e_idx + 1] = False
+            continue
+
+        eff_s = max(s_idx, min_dim - 1)
+        eff_e = min(e_idx, n_inner - min_dim)
+        mid_eff = (eff_s + eff_e) // 2 if eff_e >= eff_s else (s_idx + e_idx) // 2
+        chk_lo = max(0, mid_eff - min_dim + 1)
+        chk_hi = min(n_inner, mid_eff + min_dim)
+        if np.any(sharp_seam[chk_lo:chk_hi]):
+            validated[s_idx : e_idx + 1] = False
+
+    return validated, is_hairline_sheet
 
 
 def _collapse_gutter_runs_vec(scores: np.ndarray, is_gutter: np.ndarray) -> None:
@@ -342,6 +541,38 @@ def _collapse_gutter_runs_vec(scores: np.ndarray, is_gutter: np.ndarray) -> None
         is_gutter[mid] = True
 
 
+def _prominence_1d(raw: np.ndarray, half_win: int = 6) -> np.ndarray:
+    """
+    计算一维缝隙能量曲线相对于两侧局部背景基线的突出度（Prominence SNR）。
+
+    抑制平滑渐变背景带、连续图表纹理与 JPEG 压缩区块带来的宽域基准抬升，
+    使 1~2px 锐利面板拼接边缘获得高信噪比峰值。
+
+    :param raw: 原始轴向对数对比度均值曲线。
+    :type raw: numpy.ndarray
+    :param half_win: 邻域基线采样窗口半径（默认 6 像素，跳过紧邻中心 ±2px 过渡肩部）。
+    :type half_win: int
+    :return: 非负局部突出度向量（float32）。
+    :author: tongliga
+    :date: 2026-11-25
+    """
+    n = raw.size
+    if n < half_win * 2:
+        return raw
+    pad = np.pad(raw, half_win, mode="edge")
+    if half_win >= 6:
+        l_min = np.minimum(np.minimum(pad[0:n], pad[1 : n + 1]), np.minimum(pad[2 : n + 2], pad[3 : n + 3]))
+        r_min = np.minimum(
+            np.minimum(pad[half_win + 3 : half_win + 3 + n], pad[half_win + 4 : half_win + 4 + n]),
+            np.minimum(pad[half_win + 5 : half_win + 5 + n], pad[half_win + 6 : half_win + 6 + n]),
+        )
+    else:
+        l_min = np.minimum(pad[0:n], pad[1 : n + 1])
+        r_min = np.minimum(pad[2 * half_win - 1 : 2 * half_win - 1 + n], pad[2 * half_win : 2 * half_win + n])
+    bg_1d = 0.5 * (l_min + r_min)
+    return np.maximum(0.0, raw - 0.85 * bg_1d)
+
+
 def _profile_horizontal_seams(
     img: np.ndarray,
     x0: int,
@@ -354,9 +585,11 @@ def _profile_horizontal_seams(
     is_trans: bool,
     bg_noise: float = 0.0,
     return_curve: bool = False,
+    threshold: float = 12.9,
+    allow_sparse_gutter: bool = True,
 ) -> Tuple[Optional[_SeamProfile], Optional[np.ndarray]]:
     """
-    在指定矩形区域内进行水平缝隙扫描与多因子能量评分（全 uint8 OpenCV SIMD 加速）。
+    在指定矩形区域内进行水平缝隙扫描与多因子能量评分（全 uint8 OpenCV SIMD + LUT + 突出度增强）。
 
     :param img: 全局只读图像矩阵。
     :type img: numpy.ndarray
@@ -398,30 +631,33 @@ def _profile_horizontal_seams(
     c_prev = strip[:-2]
     c_next = strip[2:]
 
-    # 第三步：采用 OpenCV SIMD 计算步长色差与对称二阶脉冲色差（uint8 空间）
+    # 第三步：SIMD 色差 + cv2.LUT 韦伯对数压缩 + 1D 局部突出度计算
     ds_u8 = _color_diff_u8(c_mid, c_next)
     avg_pn = cv2.addWeighted(c_prev, 0.5, c_next, 0.5, 0.0)
     dl_u8 = _color_diff_u8(c_mid, avg_pn)
     del avg_pn
 
-    raw_inner = 3.0 * _reduce_mean_axis1(ds_u8) + 2.1 * _reduce_mean_axis1(dl_u8)
+    raw_inner = 0.58 * _reduce_mean_axis1(cv2.LUT(ds_u8, _SEAM_LUT)) + 0.42 * _reduce_mean_axis1(
+        cv2.LUT(dl_u8, _SEAM_LUT)
+    )
     comb_u8 = cv2.add(ds_u8, dl_u8)
     del ds_u8, dl_u8
 
-    # 第四步：在 ±2px 垂直窗口内通过 SIMD 形态学膨胀评估横贯覆盖度 C(y)
-    act_thresh = int(min(14, max(5, round(5.0 + bg_noise * 1.2))))
-    _, act = cv2.threshold(comb_u8, act_thresh, 1, cv2.THRESH_BINARY)
+    # 第四步：在 ±2px 垂直窗口内通过 SIMD 形态学膨胀评估精细横贯覆盖度 C(y)
+    _, act = cv2.threshold(comb_u8, 2, 1, cv2.THRESH_BINARY)
     del comb_u8
     act_dil = cv2.dilate(act, _KERNEL_5x1, borderType=cv2.BORDER_CONSTANT, borderValue=0)
     del act
     cov_inner = _reduce_mean_axis1(act_dil)
     del act_dil
 
+    prom_inner = _prominence_1d(raw_inner, half_win=6)
+
     # 第五步：计算抗局部异常值干扰的切向平滑度（截断单点剧烈跳变，避免角标/页码破坏真接缝）
     luma_u8 = cv2.cvtColor(c_mid, cv2.COLOR_RGB2GRAY)
     if luma_u8.shape[1] > 1:
         tang = cv2.absdiff(luma_u8[:, 1:], luma_u8[:, :-1])
-        tang_clipped = cv2.min(tang, 45)
+        tang_clipped = cv2.min(tang, 40)
         sm_inner = 3.0 * _reduce_mean_axis1(tang_clipped)
         del tang, tang_clipped
     else:
@@ -436,10 +672,11 @@ def _profile_horizontal_seams(
     sm_next[:-1] = sm_inner[1:]
     min_smooth = np.minimum(np.minimum(sm_prev, sm_inner), sm_next)
 
-    seam_inner = (raw_inner * np.power(cov_inner, 2.4)) / (1.0 + min_smooth * 0.12)
+    seam_inner = (prom_inner * np.power(cov_inner, 1.8)) / (1.0 + min_smooth * 0.12)
 
     # 第六步：针对平坦背景图像激活噪声自适应空白沟槽评分
     gutter_inner = np.zeros(span_h - 2, dtype=np.float32)
+    is_hairline_sheet = False
     if bg_uniform:
         if alpha_strip is not None:
             _, bg_bin = cv2.threshold(alpha_strip, 23, 1, cv2.THRESH_BINARY_INV)
@@ -466,7 +703,18 @@ def _profile_horizontal_seams(
                 & (ry_idx > first_fg)
                 & (ry_idx < last_fg)
             )
-            gutter_inner[g_mask] = 110.0 / (1.0 + sm_inner[g_mask])
+        else:
+            g_mask = np.zeros(span_h - 2, dtype=bool)
+        g_mask, is_hairline_sheet = _validate_gutter_mask(
+            g_mask,
+            bg_frac_full,
+            seam_inner,
+            cov_inner,
+            threshold=threshold,
+            min_dim=min_dim,
+            allow_sparse_gutter=allow_sparse_gutter,
+        )
+        gutter_inner[g_mask] = 110.0 / (1.0 + sm_inner[g_mask])
     else:
         del strip
 
@@ -492,7 +740,16 @@ def _profile_horizontal_seams(
         full_scores[1:-1] = np.maximum(seam_inner, gutter_inner)
         curve = full_scores
 
-    return _SeamProfile(positions=positions, scores=scores, coverage=c_slice, is_gutter=is_gut), curve
+    return (
+        _SeamProfile(
+            positions=positions,
+            scores=scores,
+            coverage=c_slice,
+            is_gutter=is_gut,
+            is_hairline_sheet=is_hairline_sheet,
+        ),
+        curve,
+    )
 
 
 def _profile_vertical_seams(
@@ -507,9 +764,11 @@ def _profile_vertical_seams(
     is_trans: bool,
     bg_noise: float = 0.0,
     return_curve: bool = False,
+    threshold: float = 12.9,
+    allow_sparse_gutter: bool = True,
 ) -> Tuple[Optional[_SeamProfile], Optional[np.ndarray]]:
     """
-    在指定矩形区域内进行垂直缝隙扫描与多因子能量评分（全 uint8 OpenCV SIMD 加速）。
+    在指定矩形区域内进行垂直缝隙扫描与多因子能量评分（全 uint8 OpenCV SIMD + LUT + 突出度增强）。
 
     :param img: 全局只读图像矩阵。
     :type img: numpy.ndarray
@@ -551,30 +810,33 @@ def _profile_vertical_seams(
     c_prev = strip[:, :-2]
     c_next = strip[:, 2:]
 
-    # 第三步：采用 OpenCV SIMD 计算步长色差与对称二阶脉冲色差（uint8 空间）
+    # 第三步：SIMD 色差 + cv2.LUT 韦伯对数压缩 + 1D 局部突出度计算
     ds_u8 = _color_diff_u8(c_mid, c_next)
     avg_pn = cv2.addWeighted(c_prev, 0.5, c_next, 0.5, 0.0)
     dl_u8 = _color_diff_u8(c_mid, avg_pn)
     del avg_pn
 
-    raw_inner = 3.0 * _reduce_mean_axis0(ds_u8) + 2.1 * _reduce_mean_axis0(dl_u8)
+    raw_inner = 0.58 * _reduce_mean_axis0(cv2.LUT(ds_u8, _SEAM_LUT)) + 0.42 * _reduce_mean_axis0(
+        cv2.LUT(dl_u8, _SEAM_LUT)
+    )
     comb_u8 = cv2.add(ds_u8, dl_u8)
     del ds_u8, dl_u8
 
     # 第四步：在 ±2px 水平窗口内通过 SIMD 形态学膨胀评估纵贯覆盖度 C(x)
-    act_thresh = int(min(14, max(5, round(5.0 + bg_noise * 1.2))))
-    _, act = cv2.threshold(comb_u8, act_thresh, 1, cv2.THRESH_BINARY)
+    _, act = cv2.threshold(comb_u8, 2, 1, cv2.THRESH_BINARY)
     del comb_u8
     act_dil = cv2.dilate(act, _KERNEL_1x5, borderType=cv2.BORDER_CONSTANT, borderValue=0)
     del act
     cov_inner = _reduce_mean_axis0(act_dil)
     del act_dil
 
+    prom_inner = _prominence_1d(raw_inner, half_win=6)
+
     # 第五步：计算抗局部异常值干扰的纵向平滑度
     luma_u8 = cv2.cvtColor(c_mid, cv2.COLOR_RGB2GRAY)
     if luma_u8.shape[0] > 1:
         tang = cv2.absdiff(luma_u8[1:, :], luma_u8[:-1, :])
-        tang_clipped = cv2.min(tang, 45)
+        tang_clipped = cv2.min(tang, 40)
         sm_inner = 3.0 * _reduce_mean_axis0(tang_clipped)
         del tang, tang_clipped
     else:
@@ -589,10 +851,11 @@ def _profile_vertical_seams(
     sm_next[:-1] = sm_inner[1:]
     min_smooth = np.minimum(np.minimum(sm_prev, sm_inner), sm_next)
 
-    seam_inner = (raw_inner * np.power(cov_inner, 2.4)) / (1.0 + min_smooth * 0.12)
+    seam_inner = (prom_inner * np.power(cov_inner, 1.8)) / (1.0 + min_smooth * 0.12)
 
     # 第六步：针对平坦背景激活噪声自适应垂直空白沟槽强化
     gutter_inner = np.zeros(span_w - 2, dtype=np.float32)
+    is_hairline_sheet = False
     if bg_uniform:
         if alpha_strip is not None:
             _, bg_bin = cv2.threshold(alpha_strip, 23, 1, cv2.THRESH_BINARY_INV)
@@ -619,7 +882,18 @@ def _profile_vertical_seams(
                 & (rx_idx > first_fg)
                 & (rx_idx < last_fg)
             )
-            gutter_inner[g_mask] = 110.0 / (1.0 + sm_inner[g_mask])
+        else:
+            g_mask = np.zeros(span_w - 2, dtype=bool)
+        g_mask, is_hairline_sheet = _validate_gutter_mask(
+            g_mask,
+            bg_frac_full,
+            seam_inner,
+            cov_inner,
+            threshold=threshold,
+            min_dim=min_dim,
+            allow_sparse_gutter=allow_sparse_gutter,
+        )
+        gutter_inner[g_mask] = 110.0 / (1.0 + sm_inner[g_mask])
     else:
         del strip
 
@@ -645,13 +919,23 @@ def _profile_vertical_seams(
         full_scores[1:-1] = np.maximum(seam_inner, gutter_inner)
         curve = full_scores
 
-    return _SeamProfile(positions=positions, scores=scores, coverage=c_slice, is_gutter=is_gut), curve
+    return (
+        _SeamProfile(
+            positions=positions,
+            scores=scores,
+            coverage=c_slice,
+            is_gutter=is_gut,
+            is_hairline_sheet=is_hairline_sheet,
+        ),
+        curve,
+    )
 
 
 def _pick_peaks_nms(
     profile: Optional[_SeamProfile],
     threshold: float,
     min_gap: int,
+    min_coverage: float = 0.70,
 ) -> List[_SeamCandidate]:
     """
     通过非极大值抑制（NMS）从缝隙剖面中筛选出互不重叠的高置信度候选分割线。
@@ -662,6 +946,8 @@ def _pick_peaks_nms(
     :type threshold: float
     :param min_gap: 两条平行分割线之间的最小间距（像素）。
     :type min_gap: int
+    :param min_coverage: 非沟槽割线最低跨度覆盖率门限，默认为 0.70。
+    :type min_coverage: float
     :return: 按坐标升序排序的高质量候选缝隙点位列表。
     :author: tongliga
     :date: 2026-11-18
@@ -670,7 +956,7 @@ def _pick_peaks_nms(
         return []
     # 过滤出符合阈值要求或属于沟槽的候选索引
     valid_idx = np.flatnonzero(
-        (profile.scores >= threshold) & (profile.is_gutter | (profile.coverage >= 0.72))
+        (profile.scores >= threshold) & (profile.is_gutter | (profile.coverage >= min_coverage))
     )
     if valid_idx.size == 0:
         return []
@@ -744,7 +1030,38 @@ def _is_region_empty_bg(
     return total > 0 and (float(fg) / float(total)) < 0.03
 
 
-def _recurse_xy(
+def _filter_hierarchy_peaks(peaks: List[_SeamCandidate], global_rails: List[int]) -> List[_SeamCandidate]:
+    """
+    在单层子条带剖分时进行层次化主次分离：防止微弱的卡片内部纹路割线与全局强主干导轨混在同一多叉划分层。
+
+    若存在强主干割线（max_score >= 30.0），仅在本层保留沟槽、全跨度高覆盖率或与顶层全局导轨对齐的强候选；
+    其余较弱的局部子候选自然下放至子节点递归层级参与全局尺度正则化评估。
+
+    :param peaks: 当前条带选出的非极大值抑制割线候选列表。
+    :type peaks: List[_SeamCandidate]
+    :param global_rails: 顶层全局投影分析抽取的贯穿导轨坐标列表。
+    :type global_rails: List[int]
+    :return: 经过层次主次过滤的割线候选列表。
+    :author: tongliga
+    :date: 2026-11-25
+    """
+    if len(peaks) <= 1:
+        return peaks
+    max_sc = max(p.score for p in peaks)
+    if max_sc < 30.0:
+        return peaks
+    kept = [
+        p
+        for p in peaks
+        if p.is_gutter
+        or p.score >= max_sc * 0.30
+        or p.coverage >= 0.90
+        or any(abs(p.pos - gr) <= 16 for gr in global_rails)
+    ]
+    return kept if kept else peaks
+
+
+def _build_bsp_tree(
     img: np.ndarray,
     x0: int,
     y0: int,
@@ -762,11 +1079,14 @@ def _recurse_xy(
     gutter_right: bool,
     gutter_bottom: bool,
     gutter_left: bool,
-    leaves: List[_RawRegion],
+    leaf_budget: List[int],
+    global_h_rails: Optional[List[int]] = None,
+    global_v_rails: Optional[List[int]] = None,
     top_curves: Optional[Dict[str, np.ndarray]] = None,
-) -> None:
+    disable_gutter: bool = False,
+) -> _BspNode:
     """
-    递归二叉空间分割（Recursive XY-Cut BSP），结合覆盖率加权与独立四边沟槽标记切分版面。
+    递归构建 XY-Cut 空间划分树（BSP Tree），跟踪独立四边沟槽标记与全局主干导轨共识。
 
     :param img: 原始图像数组。
     :type img: numpy.ndarray
@@ -778,7 +1098,7 @@ def _recurse_xy(
     :type x1: int
     :param y1: 当前子空间右下角纵坐标。
     :type y1: int
-    :param depth: 当前递归调用深度（上限 6，兼顾复杂嵌套 Bento 布局与安全边界）。
+    :param depth: 当前递归调用深度（上限 6）。
     :type depth: int
     :param min_dim: 最小允许子块跨度。
     :type min_dim: int
@@ -802,27 +1122,58 @@ def _recurse_xy(
     :type gutter_bottom: bool
     :param gutter_left: 左边缘是否来自空白沟槽。
     :type gutter_left: bool
-    :param leaves: 收集最终叶子节点区域的列表。
-    :type leaves: List[_RawRegion]
-    :param top_curves: 顶层投影曲线收集字典（用于诊断分析）。
+    :param leaf_budget: 叶子节点总数量配额计数器（避免病态图深度爆发）。
+    :type leaf_budget: List[int]
+    :param global_h_rails: 顶层水平全局主干导轨坐标集合。
+    :type global_h_rails: Optional[List[int]]
+    :param global_v_rails: 顶层垂直全局主干导轨坐标集合。
+    :type global_v_rails: Optional[List[int]]
+    :param top_curves: 顶层投影曲线收集字典。
     :type top_curves: Optional[Dict[str, numpy.ndarray]]
+    :param disable_gutter: 当上层已确认为细线分隔的白底拼版套图时，禁止深层退化为内部留白沟槽切分。
+    :type disable_gutter: bool
+    :return: 构建完成的 `_BspNode` 节点树。
     :author: tongliga
     :date: 2026-11-18
     """
     rw = x1 - x0
     rh = y1 - y0
-    if depth >= 6 or len(leaves) >= 256 or (rw < min_dim * 2 and rh < min_dim * 2):
-        leaves.append(
-            _RawRegion(x0, y0, x1, y1, parent_conf, gutter_top, gutter_right, gutter_bottom, gutter_left)
-        )
-        return
+    if depth >= 6 or leaf_budget[0] >= 256 or (rw < min_dim * 2 and rh < min_dim * 2):
+        leaf_budget[0] += 1
+        return _BspNode(x0, y0, x1, y1, parent_conf, gutter_top, gutter_right, gutter_bottom, gutter_left)
 
     capture = depth == 0 and top_curves is not None
+    enable_gutter = bg_uniform and (not disable_gutter)
+    allow_sparse_gutter = (depth == 0) or gutter_top or gutter_right or gutter_bottom or gutter_left
     h_prof, h_curve = _profile_horizontal_seams(
-        img, x0, y0, x1, y1, min_dim, bg_rgb, bg_uniform, is_trans, bg_noise=bg_noise, return_curve=capture
+        img,
+        x0,
+        y0,
+        x1,
+        y1,
+        min_dim,
+        bg_rgb,
+        enable_gutter,
+        is_trans,
+        bg_noise=bg_noise,
+        return_curve=capture,
+        threshold=threshold,
+        allow_sparse_gutter=allow_sparse_gutter,
     )
     v_prof, v_curve = _profile_vertical_seams(
-        img, x0, y0, x1, y1, min_dim, bg_rgb, bg_uniform, is_trans, bg_noise=bg_noise, return_curve=capture
+        img,
+        x0,
+        y0,
+        x1,
+        y1,
+        min_dim,
+        bg_rgb,
+        enable_gutter,
+        is_trans,
+        bg_noise=bg_noise,
+        return_curve=capture,
+        threshold=threshold,
+        allow_sparse_gutter=allow_sparse_gutter,
     )
     if capture and top_curves is not None:
         if h_curve is not None:
@@ -830,8 +1181,20 @@ def _recurse_xy(
         if v_curve is not None:
             top_curves["v"] = v_curve
 
-    h_peaks = _pick_peaks_nms(h_prof, threshold, min_dim)
-    v_peaks = _pick_peaks_nms(v_prof, threshold, min_dim)
+    min_cov = 0.96 if (disable_gutter and depth >= 2) else 0.70
+    h_peaks = _pick_peaks_nms(h_prof, threshold, min_dim, min_coverage=min_cov)
+    v_peaks = _pick_peaks_nms(v_prof, threshold, min_dim, min_coverage=min_cov)
+
+    if depth == 0:
+        global_h_rails = [
+            p.pos for p in h_peaks if p.is_gutter or (p.score >= max(threshold, 14.0) and p.coverage >= 0.72)
+        ]
+        global_v_rails = [
+            p.pos for p in v_peaks if p.is_gutter or (p.score >= max(threshold, 14.0) and p.coverage >= 0.72)
+        ]
+    else:
+        h_peaks = _filter_hierarchy_peaks(h_peaks, global_h_rails or [])
+        v_peaks = _filter_hierarchy_peaks(v_peaks, global_v_rails or [])
 
     # 深度 >= 4 时仅允许纯净背景沟槽继续嵌套切分，防止误切幻灯片/卡片内部的标题栏与装饰色带
     if depth >= 4:
@@ -839,10 +1202,8 @@ def _recurse_xy(
         v_peaks = [p for p in v_peaks if p.is_gutter]
 
     if not h_peaks and not v_peaks:
-        leaves.append(
-            _RawRegion(x0, y0, x1, y1, parent_conf, gutter_top, gutter_right, gutter_bottom, gutter_left)
-        )
-        return
+        leaf_budget[0] += 1
+        return _BspNode(x0, y0, x1, y1, parent_conf, gutter_top, gutter_right, gutter_bottom, gutter_left)
 
     # 采用覆盖率加权与沟槽优先原则仲裁横/纵切割轴，避免 Bento 布局误穿通高列
     h_has_gutter = any(p.is_gutter for p in h_peaks)
@@ -857,193 +1218,228 @@ def _recurse_xy(
     else:
         choose_h = bool(h_peaks) and (not v_peaks or h_eff >= v_eff * 0.85)
 
+    any_hairline_sheet = bool(
+        (h_prof is not None and h_prof.is_hairline_sheet) or (v_prof is not None and v_prof.is_hairline_sheet)
+    )
+    node = _BspNode(x0, y0, x1, y1, parent_conf, gutter_top, gutter_right, gutter_bottom, gutter_left)
     if choose_h:
+        child_disable_gutter = disable_gutter or (any_hairline_sheet and not h_has_gutter)
+        node.axis = "h"
+        node.cuts = [(p.pos, p.score, p.coverage, p.is_gutter) for p in h_peaks]
         bounds = [y0] + [p.pos for p in h_peaks] + [y1]
-        n_seg = len(bounds) - 1
-        for i in range(n_seg):
+        for i in range(len(bounds) - 1):
             p_idx = 0 if i == 0 else i - 1
             gt = h_peaks[i - 1].is_gutter if i > 0 else gutter_top
             gb = h_peaks[i].is_gutter if i < len(h_peaks) else gutter_bottom
-            _recurse_xy(
-                img,
-                x0,
-                bounds[i],
-                x1,
-                bounds[i + 1],
-                depth + 1,
-                min_dim,
-                threshold,
-                bg_rgb,
-                bg_uniform,
-                is_trans,
-                bg_noise,
-                max(parent_conf, h_peaks[p_idx].score),
-                gt,
-                gutter_right,
-                gb,
-                gutter_left,
-                leaves,
+            node.children.append(
+                _build_bsp_tree(
+                    img,
+                    x0,
+                    bounds[i],
+                    x1,
+                    bounds[i + 1],
+                    depth + 1,
+                    min_dim,
+                    threshold,
+                    bg_rgb,
+                    bg_uniform,
+                    is_trans,
+                    bg_noise,
+                    max(parent_conf, h_peaks[p_idx].score),
+                    gt,
+                    gutter_right,
+                    gb,
+                    gutter_left,
+                    leaf_budget,
+                    global_h_rails=global_h_rails,
+                    global_v_rails=global_v_rails,
+                    disable_gutter=child_disable_gutter,
+                )
             )
     else:
+        child_disable_gutter = disable_gutter or (any_hairline_sheet and not v_has_gutter)
+        node.axis = "v"
+        node.cuts = [(p.pos, p.score, p.coverage, p.is_gutter) for p in v_peaks]
         bounds = [x0] + [p.pos for p in v_peaks] + [x1]
-        n_seg = len(bounds) - 1
-        for i in range(n_seg):
+        for i in range(len(bounds) - 1):
             p_idx = 0 if i == 0 else i - 1
             gl = v_peaks[i - 1].is_gutter if i > 0 else gutter_left
             gr = v_peaks[i].is_gutter if i < len(v_peaks) else gutter_right
-            _recurse_xy(
-                img,
-                bounds[i],
-                y0,
-                bounds[i + 1],
-                y1,
-                depth + 1,
-                min_dim,
-                threshold,
-                bg_rgb,
-                bg_uniform,
-                is_trans,
-                bg_noise,
-                max(parent_conf, v_peaks[p_idx].score),
-                gutter_top,
-                gr,
-                gutter_bottom,
-                gl,
-                leaves,
+            node.children.append(
+                _build_bsp_tree(
+                    img,
+                    bounds[i],
+                    y0,
+                    bounds[i + 1],
+                    y1,
+                    depth + 1,
+                    min_dim,
+                    threshold,
+                    bg_rgb,
+                    bg_uniform,
+                    is_trans,
+                    bg_noise,
+                    max(parent_conf, v_peaks[p_idx].score),
+                    gutter_top,
+                    gr,
+                    gutter_bottom,
+                    gl,
+                    leaf_budget,
+                    global_h_rails=global_h_rails,
+                    global_v_rails=global_v_rails,
+                    disable_gutter=child_disable_gutter,
+                )
             )
+    return node
 
 
 def _sibling_propagate_h(
     img: np.ndarray,
-    leaf: _RawRegion,
+    leaf: _BspNode,
     y_cut: int,
     min_dim: int,
-    bg_noise: float = 0.0,
-) -> Optional[Tuple[int, float]]:
+    prop_threshold: float,
+) -> Optional[Tuple[int, float, float]]:
     """
-    沿邻居叶子节点的水平割线在当前区域内进行 ±12px 范围的割线对齐传播探测。
+    沿邻居叶子节点的水平割线在当前区域内进行 ±12px 范围的 LUT 突显度对齐传播探测。
 
-    使用 OpenCV SIMD 双通道色差、±1px 垂直邻域覆盖度聚合与三行最小切向平滑度过滤，
-    稳定召回浅灰/白底微弱对齐细线，同时防止误切高纹理 Bento 通高卡片。
+    使用 OpenCV SIMD 双通道色差 + `cv2.LUT` 韦伯压缩 + 局部基线突出度与 ±1px 邻域覆盖率，
+    稳定召回白底/浅灰极弱对齐细线及渐变边沿面板边界，同时防止误切高纹理通高 Bento 卡片。
 
     :param img: 原始图像数组，要求为三维 uint8 数组（H, W, C）。
     :type img: numpy.ndarray
     :param leaf: 当前待尝试继续分割的叶子节点区域。
-    :type leaf: _RawRegion
+    :type leaf: _BspNode
     :param y_cut: 邻居叶子节点产生的水平割线候选纵坐标。
     :type y_cut: int
     :param min_dim: 最小允许子块高度或宽度跨度。
     :type min_dim: int
-    :param bg_noise: 背景单通道噪声估计值。
-    :type bg_noise: float
-    :return: 若探测成功则返回最佳对齐纵坐标与置信度得分的二元组 (best_y, score)，否则返回 None。
+    :param prop_threshold: 邻居传播唤醒所需的最低缝隙评分阈值。
+    :type prop_threshold: float
+    :return: 若探测成功则返回 ``(best_y, score, coverage)``，否则返回 None。
     :author: tongliga
     :date: 2026-11-18
     """
-    # 第一步：计算在当前叶子节点内的安全探测搜索区间 [y_lo, y_hi]
-    y_lo = max(leaf.y0 + min_dim, y_cut - 12)
-    y_hi = min(leaf.y1 - min_dim, y_cut + 12)
-    if y_hi < y_lo or leaf.x1 - leaf.x0 <= 8:
+    # 第一步：计算在当前叶子节点内的安全探测搜索区间及突出度上下文区间
+    lo = max(leaf.y0 + min_dim, y_cut - 12)
+    hi = min(leaf.y1 - min_dim, y_cut + 12)
+    if hi < lo or leaf.x1 - leaf.x0 <= 10:
         return None
+    clo = max(leaf.y0 + 1, lo - 4)
+    chi = min(leaf.y1 - 1, hi + 4)
 
-    # 第二步：采用 OpenCV INTER_NEAREST 沿横向提取待分析的紧凑条带
-    if leaf.x1 - leaf.x0 <= 10:
-        return None
-    strip, _ = _sample_strip(img, leaf.x0 + 4, y_lo - 1, leaf.x1 - 4, y_hi + 2, 200, y_hi - y_lo + 3)
+    # 第二步：采用 OpenCV INTER_NEAREST 沿横向提取带基线上下文的紧凑条带
+    strip, _ = _sample_strip(img, leaf.x0 + 4, clo - 1, leaf.x1 - 4, chi + 2, 200, chi - clo + 3)
     if strip.shape[0] < 3 or strip.shape[1] < 2:
         return None
 
-    # 第三步：计算中心行与相邻行的 SIMD 均衡色差及对称二阶脉冲差
+    # 第三步：计算中心行与相邻行的 SIMD 均衡色差、LUT 对比度及 1D 局部突出度
     c_mid = strip[1:-1]
     c_prev = strip[:-2]
     c_next = strip[2:]
     ds_u8 = _color_diff_u8(c_mid, c_next)
     dl_u8 = _color_diff_u8(c_mid, cv2.addWeighted(c_prev, 0.5, c_next, 0.5, 0.0))
+    raw = 0.58 * _reduce_mean_axis1(cv2.LUT(ds_u8, _SEAM_LUT)) + 0.42 * _reduce_mean_axis1(
+        cv2.LUT(dl_u8, _SEAM_LUT)
+    )
     comb_u8 = cv2.add(ds_u8, dl_u8)
 
-    # 第四步：计算 ±1px 邻域覆盖率、能量与最小三行切向平滑度，严格门控弱割线召回
-    _, act = cv2.threshold(comb_u8, max(2, int(round(2.0 + bg_noise * 0.6))), 1, cv2.THRESH_BINARY)
-    act_dil = cv2.dilate(act, _KERNEL_3x1, borderType=cv2.BORDER_CONSTANT, borderValue=0)
-    cov = _reduce_mean_axis1(act_dil)
-    avg_raw = 3.0 * _reduce_mean_axis1(comb_u8)
+    # 第四步：评估 ±1px 覆盖度、突出度信噪比与三行最小平滑度
+    _, act = cv2.threshold(comb_u8, 2, 1, cv2.THRESH_BINARY)
+    cov = _reduce_mean_axis1(cv2.dilate(act, _KERNEL_3x1, borderType=cv2.BORDER_CONSTANT, borderValue=0))
+    prom = _prominence_1d(raw, half_win=4)
 
-    luma = cv2.cvtColor(strip, cv2.COLOR_RGB2GRAY)
-    tang_all = cv2.min(cv2.absdiff(luma[:, 1:], luma[:, :-1]), 45)
-    sm_all = 3.0 * _reduce_mean_axis1(tang_all)
-    min_sm = np.minimum(np.minimum(sm_all[:-2], sm_all[1:-1]), sm_all[2:])
+    luma = cv2.cvtColor(c_mid, cv2.COLOR_RGB2GRAY)
+    tang = cv2.min(cv2.absdiff(luma[:, 1:], luma[:, :-1]), 40)
+    sm = 3.0 * _reduce_mean_axis1(tang)
+    sm_p = np.pad(sm, 1, mode="edge")
+    min_sm = np.minimum(np.minimum(sm_p[:-2], sm_p[1:-1]), sm_p[2:])
+    sc = (prom * np.power(cov, 1.8)) / (1.0 + min_sm * 0.12)
 
-    sm_limit = 2.6 + bg_noise * 0.5
-    valid = (cov >= 0.80) & (avg_raw >= 10.0) & (min_sm < sm_limit)
+    off = lo - clo
+    span_len = hi - lo + 1
+    sc_w = sc[off : off + span_len]
+    cov_w = cov[off : off + span_len]
+    prom_w = prom[off : off + span_len]
+
+    valid = (cov_w >= 0.78) & (prom_w >= 6.0) & (sc_w >= prop_threshold)
     if not np.any(valid):
         return None
-    scores = np.where(valid, (avg_raw * cov) / (1.0 + min_sm * 0.2), -1.0)
-    best_idx = int(np.argmax(scores))
-    return y_lo + best_idx, float(scores[best_idx])
+    best_idx = int(np.argmax(np.where(valid, sc_w, -1.0)))
+    return lo + best_idx, float(sc_w[best_idx]), float(cov_w[best_idx])
 
 
 def _sibling_propagate_v(
     img: np.ndarray,
-    leaf: _RawRegion,
+    leaf: _BspNode,
     x_cut: int,
     min_dim: int,
-    bg_noise: float = 0.0,
-) -> Optional[Tuple[int, float]]:
+    prop_threshold: float,
+) -> Optional[Tuple[int, float, float]]:
     """
-    沿邻居叶子节点的垂直割线在当前区域内进行 ±12px 范围的割线对齐传播探测。
+    沿邻居叶子节点的垂直割线在当前区域内进行 ±12px 范围的 LUT 突显度对齐传播探测。
 
     :param img: 原始图像数组，要求为三维 uint8 数组（H, W, C）。
     :type img: numpy.ndarray
     :param leaf: 当前待尝试继续分割的叶子节点区域。
-    :type leaf: _RawRegion
+    :type leaf: _BspNode
     :param x_cut: 邻居叶子节点产生的垂直割线候选横坐标。
     :type x_cut: int
     :param min_dim: 最小允许子块高度或宽度跨度。
     :type min_dim: int
-    :param bg_noise: 背景单通道噪声估计值。
-    :type bg_noise: float
-    :return: 若探测成功则返回最佳对齐横坐标与置信度得分的二元组 (best_x, score)，否则返回 None。
+    :param prop_threshold: 邻居传播唤醒所需的最低缝隙评分阈值。
+    :type prop_threshold: float
+    :return: 若探测成功则返回 ``(best_x, score, coverage)``，否则返回 None。
     :author: tongliga
     :date: 2026-11-18
     """
-    # 第一步：计算在当前叶子节点内的安全探测搜索区间 [x_lo, x_hi]
-    x_lo = max(leaf.x0 + min_dim, x_cut - 12)
-    x_hi = min(leaf.x1 - min_dim, x_cut + 12)
-    if x_hi < x_lo or leaf.y1 - leaf.y0 <= 8:
+    # 第一步：计算在当前叶子节点内的安全探测搜索区间及突出度上下文区间
+    lo = max(leaf.x0 + min_dim, x_cut - 12)
+    hi = min(leaf.x1 - min_dim, x_cut + 12)
+    if hi < lo or leaf.y1 - leaf.y0 <= 10:
         return None
+    clo = max(leaf.x0 + 1, lo - 4)
+    chi = min(leaf.x1 - 1, hi + 4)
 
-    # 第二步：采用 OpenCV INTER_NEAREST 沿纵向提取待分析的紧凑条带
-    if leaf.y1 - leaf.y0 <= 10:
-        return None
-    strip, _ = _sample_strip(img, x_lo - 1, leaf.y0 + 4, x_hi + 2, leaf.y1 - 4, x_hi - x_lo + 3, 200)
+    # 第二步：采用 OpenCV INTER_NEAREST 沿纵向提取带基线上下文的紧凑条带
+    strip, _ = _sample_strip(img, clo - 1, leaf.y0 + 4, chi + 2, leaf.y1 - 4, chi - clo + 3, 200)
     if strip.shape[1] < 3 or strip.shape[0] < 2:
         return None
 
-    # 第三步：计算中心列与相邻列的 SIMD 均衡色差及对称二阶脉冲差
+    # 第三步：计算中心列与相邻列的 SIMD 均衡色差、LUT 对比度及 1D 局部突出度
     c_mid = strip[:, 1:-1]
     c_prev = strip[:, :-2]
     c_next = strip[:, 2:]
     ds_u8 = _color_diff_u8(c_mid, c_next)
     dl_u8 = _color_diff_u8(c_mid, cv2.addWeighted(c_prev, 0.5, c_next, 0.5, 0.0))
+    raw = 0.58 * _reduce_mean_axis0(cv2.LUT(ds_u8, _SEAM_LUT)) + 0.42 * _reduce_mean_axis0(
+        cv2.LUT(dl_u8, _SEAM_LUT)
+    )
     comb_u8 = cv2.add(ds_u8, dl_u8)
 
-    # 第四步：计算 ±1px 邻域覆盖率、能量与最小三列切向平滑度
-    _, act = cv2.threshold(comb_u8, max(2, int(round(2.0 + bg_noise * 0.6))), 1, cv2.THRESH_BINARY)
-    act_dil = cv2.dilate(act, _KERNEL_1x3, borderType=cv2.BORDER_CONSTANT, borderValue=0)
-    cov = _reduce_mean_axis0(act_dil)
-    avg_raw = 3.0 * _reduce_mean_axis0(comb_u8)
+    # 第四步：评估 ±1px 覆盖度、突出度信噪比与三列最小平滑度
+    _, act = cv2.threshold(comb_u8, 2, 1, cv2.THRESH_BINARY)
+    cov = _reduce_mean_axis0(cv2.dilate(act, _KERNEL_1x3, borderType=cv2.BORDER_CONSTANT, borderValue=0))
+    prom = _prominence_1d(raw, half_win=4)
 
-    luma = cv2.cvtColor(strip, cv2.COLOR_RGB2GRAY)
-    tang_all = cv2.min(cv2.absdiff(luma[1:, :], luma[:-1, :]), 45)
-    sm_all = 3.0 * _reduce_mean_axis0(tang_all)
-    min_sm = np.minimum(np.minimum(sm_all[:-2], sm_all[1:-1]), sm_all[2:])
+    luma = cv2.cvtColor(c_mid, cv2.COLOR_RGB2GRAY)
+    tang = cv2.min(cv2.absdiff(luma[1:, :], luma[:-1, :]), 40)
+    sm = 3.0 * _reduce_mean_axis0(tang)
+    sm_p = np.pad(sm, 1, mode="edge")
+    min_sm = np.minimum(np.minimum(sm_p[:-2], sm_p[1:-1]), sm_p[2:])
+    sc = (prom * np.power(cov, 1.8)) / (1.0 + min_sm * 0.12)
 
-    sm_limit = 2.6 + bg_noise * 0.5
-    valid = (cov >= 0.80) & (avg_raw >= 10.0) & (min_sm < sm_limit)
+    off = lo - clo
+    span_len = hi - lo + 1
+    sc_w = sc[off : off + span_len]
+    cov_w = cov[off : off + span_len]
+    prom_w = prom[off : off + span_len]
+
+    valid = (cov_w >= 0.78) & (prom_w >= 6.0) & (sc_w >= prop_threshold)
     if not np.any(valid):
         return None
-    scores = np.where(valid, (avg_raw * cov) / (1.0 + min_sm * 0.2), -1.0)
-    best_idx = int(np.argmax(scores))
-    return x_lo + best_idx, float(scores[best_idx])
+    best_idx = int(np.argmax(np.where(valid, sc_w, -1.0)))
+    return lo + best_idx, float(sc_w[best_idx]), float(cov_w[best_idx])
 
 
 def _refine_and_trim(
@@ -1161,9 +1557,9 @@ def _refine_and_trim(
                 if float(e_w[idx]) > 15.0:
                     x1 = xa + idx
 
-    # 第二阶段：向量化剥离四周单色平坦/透明背景边缘（采用 SIMD INTER_NEAREST 一次性采样扫描）
+    # 第二阶段：仅当区块边界来自背景沟槽（raw.is_gutter）时剥离四周空白边缘，保留无缝白底幻灯片完整内边距
     tt = tr = tb = tl = 0
-    if bg_uniform and x1 - x0 > 24 and y1 - y0 > 24:
+    if bg_uniform and raw.is_gutter and x1 - x0 > 24 and y1 - y0 > 24:
         bg_scalar = (int(bg_rgb[0]), int(bg_rgb[1]), int(bg_rgb[2]), 0)
         bg_tol = int(min(18, max(7, round(7.0 + bg_noise * 2.5))))
         need_alpha = is_trans and ch >= 4
@@ -1337,6 +1733,306 @@ def _group_reading_order(
     return ordered_groups
 
 
+def _flatten_same_axis(node: _BspNode) -> None:
+    """
+    将 BSP 树中父子连续同轴的多叉拆分节点就地展平，消除邻居传播产生的同轴二级嵌套。
+
+    :param node: 待处理的 BSP 树节点。
+    :type node: _BspNode
+    :author: tongliga
+    :date: 2026-11-25
+    """
+    if not node.children:
+        return
+    for child in node.children:
+        _flatten_same_axis(child)
+    new_children: List[_BspNode] = []
+    new_cuts: List[Tuple[int, float, float, bool]] = []
+    for idx, ch in enumerate(node.children):
+        if ch.axis == node.axis and ch.children:
+            new_children.extend(ch.children)
+            new_cuts.extend(ch.cuts)
+        else:
+            new_children.append(ch)
+        if idx < len(node.cuts):
+            new_cuts.append(node.cuts[idx])
+    node.children = new_children
+    node.cuts = new_cuts
+
+
+def _dominant_tile_dims(peers: List[_BspNode]) -> Tuple[float, float, float, float]:
+    """
+    使用面积加权众数聚类计算同类切片的共识主导尺寸及集群一致性面积占比。
+
+    面积加权保证即使个别内部幻灯片碎裂出多块小区域，其在全画面积中的权重占比依然很小，
+    主干规律宫格/卡片尺寸始终能够稳定胜出。
+
+    :param peers: 用于估算参考尺寸的同伴叶子节点列表。
+    :type peers: List[_BspNode]
+    :return: 四元组 ``(w_dom, h_dom, w_area_fraction, h_area_fraction)``。
+    :author: tongliga
+    :date: 2026-11-25
+    """
+
+    def _cluster_dom(vals: List[float], weights: List[float]) -> Tuple[float, float]:
+        total_w = max(1e-6, sum(weights))
+        best_score = -1.0
+        best_val = vals[0]
+        for v in vals:
+            tol = max(14.0, v * 0.16)
+            in_cl = [i for i, x in enumerate(vals) if abs(x - v) <= tol]
+            w_sum = sum(weights[i] for i in in_cl)
+            if w_sum > best_score:
+                best_score = w_sum
+                best_val = sum(vals[i] * weights[i] for i in in_cl) / max(1e-6, w_sum)
+        return best_val, best_score / total_w
+
+    ws = [float(p.x1 - p.x0) for p in peers]
+    hs = [float(p.y1 - p.y0) for p in peers]
+    areas = [w * h for w, h in zip(ws, hs)]
+    w_dom, w_frac = _cluster_dom(ws, areas)
+    h_dom, h_frac = _cluster_dom(hs, areas)
+    return w_dom, h_dom, w_frac, h_frac
+
+
+def _subtree_has_gutter(node: _BspNode) -> bool:
+    """
+    递归检查当前 BSP 子树内部是否包含任意纯净背景沟槽切分线。
+
+    :param node: 待检查的 BSP 子树根节点。
+    :type node: _BspNode
+    :return: 若子树中任意层级包含背景沟槽割线则返回 True。
+    :author: tongliga
+    :date: 2026-11-25
+    """
+    if any(cut[3] for cut in node.cuts):
+        return True
+    return any(_subtree_has_gutter(ch) for ch in node.children)
+
+
+def _regularize_bsp_tree(root: _BspNode) -> None:
+    """
+    执行自底向上同轴子树折叠与相邻兄弟异常切分合并，保障整版切片尺寸及长宽比协调一致。
+
+    针对幻灯片套图、拼图网格内部常见的“分屏人物写真”、“深色表头横幅”或“三栏小卡片”等高对比度内部构图：
+    1. 严格豁免所有背景沟槽切割与在邻近同伴间存在贯穿对齐支撑的导轨割线；
+    2. 结合面积加权同伴尺寸共识 `(W_dom, H_dom)` 与对数长宽比例一致性，仅剪除导致局部尺寸显著萎缩（`< 0.72 * dom`）、
+       且合并后可精确回归版面主导尺度的非沟槽内部误切（既包括整棵多级误切子树，也包括条带内的局部相邻兄弟分屏）。
+
+    :param root: 经过初步构建与兄弟传播后的 BSP 空间树根节点。
+    :type root: _BspNode
+    :author: tongliga
+    :date: 2026-11-25
+    """
+    changed = True
+    while changed:
+        changed = False
+        _flatten_same_axis(root)
+        all_leaves = root.collect_leaves()
+        if len(all_leaves) < 5:
+            break
+
+        # 阶段 A：同轴非沟槽误切子树整体折叠（消除嵌套多级表格/图文区块误切）
+        best_sub: Optional[_BspNode] = None
+        best_sub_gain = 0.0
+
+        def _walk_sub(node: _BspNode) -> None:
+            nonlocal best_sub, best_sub_gain
+            if not node.children:
+                return
+            for child in node.children:
+                _walk_sub(child)
+            has_outer_gutter = node.gutter_top or node.gutter_right or node.gutter_bottom or node.gutter_left
+            if (_subtree_has_gutter(node) and (node is root or has_outer_gutter)) or node.axis is None:
+                return
+
+            desc_ids = {id(lf) for lf in node.collect_leaves()}
+            peers = [lf for lf in all_leaves if id(lf) not in desc_ids]
+            if len(peers) < 3:
+                return
+
+            w_dom, h_dom, w_frac, h_frac = _dominant_tile_dims(peers)
+            dom_frac = h_frac if node.axis == "h" else w_frac
+            if dom_frac < 0.50:
+                return
+            dom = h_dom if node.axis == "h" else w_dom
+            n_dim = float((node.y1 - node.y0) if node.axis == "h" else (node.x1 - node.x0))
+            n_err = abs(math.log(max(1.0, n_dim) / max(1.0, dom)))
+            if n_err > 0.25:
+                return
+
+            # 检查该子树切线在常态维度同伴间是否存在跨区块对齐支撑
+            align_tol = 8
+            for cpos, _, _, _ in node.cuts:
+                if node.axis == "v":
+                    if any(
+                        (p.y1 - p.y0) >= h_dom * 0.72 and (abs(p.x0 - cpos) <= align_tol or abs(p.x1 - cpos) <= align_tol)
+                        for p in peers
+                    ):
+                        return
+                else:
+                    if any(
+                        (p.x1 - p.x0) >= w_dom * 0.72 and (abs(p.y0 - cpos) <= align_tol or abs(p.y1 - cpos) <= align_tol)
+                        for p in peers
+                    ):
+                        return
+
+            sub_leaves = node.collect_leaves()
+            for sl in sub_leaves:
+                sw = sl.x1 - sl.x0
+                sh = sl.y1 - sl.y0
+                peer_matches = sum(
+                    1
+                    for p in peers
+                    if abs((p.x1 - p.x0) - sw) <= max(14.0, 0.16 * sw)
+                    and abs((p.y1 - p.y0) - sh) <= max(14.0, 0.16 * sh)
+                )
+                if peer_matches >= 2:
+                    return
+
+            leaf_dims = [float((lf.y1 - lf.y0) if node.axis == "h" else (lf.x1 - lf.x0)) for lf in sub_leaves]
+            leaf_errs = [abs(math.log(max(1.0, d) / max(1.0, dom))) for d in leaf_dims]
+            mean_leaf_err = sum(leaf_errs) / float(len(leaf_errs))
+            if min(leaf_dims) / max(1.0, dom) < 0.72 and mean_leaf_err > 0.35 and n_err < mean_leaf_err * 0.45:
+                gain = mean_leaf_err - n_err
+                if gain > best_sub_gain:
+                    best_sub_gain = gain
+                    best_sub = node
+
+        _walk_sub(root)
+        if best_sub is not None:
+            best_sub.children = []
+            best_sub.cuts = []
+            best_sub.axis = None
+            changed = True
+            continue
+
+        # 阶段 B：连续相邻非沟槽叶子兄弟异常分块合并（支持 2~5 块连续局部条带如分屏/三栏内嵌图回归主导尺寸）
+        best_span: Optional[Tuple[_BspNode, int, int]] = None
+        best_span_gain = 0.0
+
+        def _walk_span(node: _BspNode) -> None:
+            nonlocal best_span, best_span_gain
+            if not node.children:
+                return
+            for child in node.children:
+                _walk_span(child)
+            n_ch = len(node.children)
+            if n_ch < 2 or node.axis is None:
+                return
+
+            is_v = node.axis == "v"
+            max_span = min(5, n_ch)
+            for span_len in range(2, max_span + 1):
+                for start in range(0, n_ch - span_len + 1):
+                    end = start + span_len
+                    group = node.children[start:end]
+                    if any(ch.children for ch in group):
+                        continue
+                    internal_cuts = node.cuts[start : end - 1]
+                    has_outer_gutter = node.gutter_top or node.gutter_right or node.gutter_bottom or node.gutter_left
+                    if any(cut[3] for cut in internal_cuts) and (node is root or has_outer_gutter):
+                        continue
+
+                    group_ids = {id(ch) for ch in group}
+                    peers = [lf for lf in all_leaves if id(lf) not in group_ids]
+                    if len(peers) < 3:
+                        continue
+
+                    w_dom, h_dom, w_frac, h_frac = _dominant_tile_dims(peers)
+                    dom_frac = w_frac if is_v else h_frac
+                    if dom_frac < 0.50:
+                        continue
+
+                    align_tol = 8
+                    aligned_ext = False
+                    for cut_pos, _, _, _ in internal_cuts:
+                        if is_v:
+                            if any(
+                                (p.y1 - p.y0) >= h_dom * 0.72
+                                and (abs(p.x0 - cut_pos) <= align_tol or abs(p.x1 - cut_pos) <= align_tol)
+                                for p in peers
+                            ):
+                                aligned_ext = True
+                                break
+                        else:
+                            if any(
+                                (p.x1 - p.x0) >= w_dom * 0.72
+                                and (abs(p.y0 - cut_pos) <= align_tol or abs(p.y1 - cut_pos) <= align_tol)
+                                for p in peers
+                            ):
+                                aligned_ext = True
+                                break
+                    if aligned_ext:
+                        continue
+
+                    if any(
+                        sum(
+                            1
+                            for p in peers
+                            if abs((p.x1 - p.x0) - (ch.x1 - ch.x0)) <= max(14.0, 0.16 * (ch.x1 - ch.x0))
+                            and abs((p.y1 - p.y0) - (ch.y1 - ch.y0)) <= max(14.0, 0.16 * (ch.y1 - ch.y0))
+                        )
+                        >= 2
+                        for ch in group
+                    ):
+                        continue
+
+                    dom = w_dom if is_v else h_dom
+                    dims = [float((ch.x1 - ch.x0) if is_v else (ch.y1 - ch.y0)) for ch in group]
+                    dp = sum(dims)
+                    err_split = sum(abs(math.log(max(1.0, d) / max(1.0, dom))) for d in dims) / float(span_len)
+                    err_merged = abs(math.log(max(1.0, dp) / max(1.0, dom)))
+                    if min(dims) / max(1.0, dom) < 0.72 and err_merged <= 0.25 and err_merged < err_split * 0.48:
+                        gain = err_split - err_merged
+                        if gain > best_span_gain:
+                            best_span_gain = gain
+                            best_span = (node, start, end)
+
+        _walk_span(root)
+        if best_span is not None:
+            pnode, start, end = best_span
+            group = pnode.children[start:end]
+            first, last = group[0], group[-1]
+            max_conf = max(ch.conf for ch in group)
+            if pnode.axis == "v":
+                merged = _BspNode(
+                    first.x0,
+                    first.y0,
+                    last.x1,
+                    first.y1,
+                    max_conf,
+                    all(ch.gutter_top for ch in group),
+                    last.gutter_right,
+                    all(ch.gutter_bottom for ch in group),
+                    first.gutter_left,
+                )
+            else:
+                merged = _BspNode(
+                    first.x0,
+                    first.y0,
+                    first.x1,
+                    last.y1,
+                    max_conf,
+                    first.gutter_top,
+                    all(ch.gutter_right for ch in group),
+                    last.gutter_bottom,
+                    all(ch.gutter_left for ch in group),
+                )
+            pnode.children[start:end] = [merged]
+            del pnode.cuts[start : end - 1]
+            if len(pnode.children) == 1:
+                only = pnode.children[0]
+                pnode.children = []
+                pnode.cuts = []
+                pnode.axis = None
+                pnode.gutter_top = only.gutter_top
+                pnode.gutter_right = only.gutter_right
+                pnode.gutter_bottom = only.gutter_bottom
+                pnode.gutter_left = only.gutter_left
+            changed = True
+
+
 def xy_cut_core(
     img: np.ndarray,
     sensitivity: float,
@@ -1349,11 +2045,13 @@ def xy_cut_core(
     bg_noise: float = 0.0,
 ) -> Tuple[List[RawSplitBox], Optional[Dict[str, List[float]]]]:
     """
-    基于递归 XY-Cut 投影直方图与完整多轮邻居割线对齐传播算法的核心裁切算子。
+    基于递归 XY-Cut（LUT 突出度投影）、全局导轨共识、兄弟对齐传播与 BSP 几何正则化的核心裁切算子。
 
-    对输入图像执行递归二维投影分析，寻找能量极值与空白沟槽割线进行空间剖分；
-    随后执行多轮全叶子节点网格邻居割线对齐（Sibling Grid-Line Propagation），
-    去除纯背景废块并执行纹理感知渗色收边净化，最终按稳定阅读顺序输出边界框。
+    对输入图像执行四级流水线解构：
+    1. 递归构建 BSP 空间划分树（采用韦伯对数 LUT + 1D 局部突出度识别全贯通弱边界与空白沟槽）；
+    2. 完整多轮同级兄弟割线对齐传播（±12px 突出度召回遗漏网格边并挂载回 BSP 树）；
+    3. 自底向上 BSP 几何尺度/长宽比正则化剪枝（结合全盘主导区块大小自动收敛卡片内部高反差误切）；
+    4. 空背景滤除、视觉阅读顺序重排与纹理感知渗色收边净化。
 
     :param img: 待切分的原始图像数组，要求为三维 uint8 数组（H, W, C）。
     :type img: numpy.ndarray
@@ -1377,15 +2075,15 @@ def xy_cut_core(
     :author: tongliga
     :date: 2026-11-18
     """
-    # 第一步：根据最小尺寸比例与灵敏度推导最小块尺寸与割线能量阈值
+    # 第一步：根据最小尺寸比例与灵敏度推导最小块尺寸与 LUT 突出度阈值
     h, w, _ = img.shape
     min_dim = max(24, int(round(min(w, h) * _clamp(min_region_ratio, 0.04, 0.35))))
-    threshold = 125.0 - _clamp(sensitivity, 0.1, 1.0) * 80.0
+    threshold = 22.0 - _clamp(sensitivity, 0.1, 1.0) * 14.0
+    prop_threshold = max(7.0, threshold * 0.65)
 
-    # 第二步：启动递归 XY-Cut 投影空间二叉剖分
-    leaves: List[_RawRegion] = []
+    # 第二步：构建递归 XY-Cut BSP 空间树
     top_curves: Optional[Dict[str, np.ndarray]] = {} if collect_curves else None
-    _recurse_xy(
+    root = _build_bsp_tree(
         img,
         0,
         0,
@@ -1398,45 +2096,60 @@ def xy_cut_core(
         bg_uniform,
         is_trans,
         bg_noise,
-        120.0,
+        36.0,
         False,
         False,
         False,
         False,
-        leaves,
+        [0],
         top_curves=top_curves,
     )
 
-    # 第三步：完整多轮网格邻居割线对齐传播（单轮处理全部待对齐叶子，最多 6 轮、上限 256 块）
+    # 第三步：完整多轮网格邻居割线对齐传播（最多 6 轮、上限 256 块）
     prop_iter = 0
     propagated = True
-    while propagated and prop_iter < 6 and len(leaves) < 256:
+    while propagated and prop_iter < 6:
+        leaves_cur = root.collect_leaves()
+        if len(leaves_cur) >= 256:
+            break
         propagated = False
         prop_iter += 1
-        h_lines = sorted({y for l in leaves for y in (l.y0, l.y1) if min_dim < y < h - min_dim})
-        v_lines = sorted({x for l in leaves for x in (l.x0, l.x1) if min_dim < x < w - min_dim})
+        h_lines = sorted({y for lf in leaves_cur for y in (lf.y0, lf.y1) if min_dim < y < h - min_dim})
+        v_lines = sorted({x for lf in leaves_cur for x in (lf.x0, lf.x1) if min_dim < x < w - min_dim})
 
-        next_leaves: List[_RawRegion] = []
-        for leaf in leaves:
-            if len(next_leaves) >= 256:
-                next_leaves.append(leaf)
-                continue
-
+        for leaf in leaves_cur:
             split_done = False
             for y_cut in h_lines:
                 if leaf.y0 + min_dim <= y_cut <= leaf.y1 - min_dim:
-                    res = _sibling_propagate_h(img, leaf, y_cut, min_dim, bg_noise=bg_noise)
+                    res = _sibling_propagate_h(img, leaf, y_cut, min_dim, prop_threshold=prop_threshold)
                     if res is not None:
-                        best_y, best_sc = res
-                        a = _RawRegion(
-                            leaf.x0, leaf.y0, leaf.x1, best_y, max(leaf.conf, best_sc),
-                            leaf.gutter_top, leaf.gutter_right, False, leaf.gutter_left,
-                        )
-                        b = _RawRegion(
-                            leaf.x0, best_y, leaf.x1, leaf.y1, max(leaf.conf, best_sc),
-                            False, leaf.gutter_right, leaf.gutter_bottom, leaf.gutter_left,
-                        )
-                        next_leaves.extend([a, b])
+                        best_y, best_sc, best_cov = res
+                        leaf.axis = "h"
+                        leaf.cuts = [(best_y, best_sc, best_cov, False)]
+                        leaf.children = [
+                            _BspNode(
+                                leaf.x0,
+                                leaf.y0,
+                                leaf.x1,
+                                best_y,
+                                max(leaf.conf, best_sc),
+                                leaf.gutter_top,
+                                leaf.gutter_right,
+                                False,
+                                leaf.gutter_left,
+                            ),
+                            _BspNode(
+                                leaf.x0,
+                                best_y,
+                                leaf.x1,
+                                leaf.y1,
+                                max(leaf.conf, best_sc),
+                                False,
+                                leaf.gutter_right,
+                                leaf.gutter_bottom,
+                                leaf.gutter_left,
+                            ),
+                        ]
                         propagated = True
                         split_done = True
                         break
@@ -1445,40 +2158,55 @@ def xy_cut_core(
 
             for x_cut in v_lines:
                 if leaf.x0 + min_dim <= x_cut <= leaf.x1 - min_dim:
-                    res = _sibling_propagate_v(img, leaf, x_cut, min_dim, bg_noise=bg_noise)
+                    res = _sibling_propagate_v(img, leaf, x_cut, min_dim, prop_threshold=prop_threshold)
                     if res is not None:
-                        best_x, best_sc = res
-                        a = _RawRegion(
-                            leaf.x0, leaf.y0, best_x, leaf.y1, max(leaf.conf, best_sc),
-                            leaf.gutter_top, False, leaf.gutter_bottom, leaf.gutter_left,
-                        )
-                        b = _RawRegion(
-                            best_x, leaf.y0, leaf.x1, leaf.y1, max(leaf.conf, best_sc),
-                            leaf.gutter_top, leaf.gutter_right, leaf.gutter_bottom, False,
-                        )
-                        next_leaves.extend([a, b])
+                        best_x, best_sc, best_cov = res
+                        leaf.axis = "v"
+                        leaf.cuts = [(best_x, best_sc, best_cov, False)]
+                        leaf.children = [
+                            _BspNode(
+                                leaf.x0,
+                                leaf.y0,
+                                best_x,
+                                leaf.y1,
+                                max(leaf.conf, best_sc),
+                                leaf.gutter_top,
+                                False,
+                                leaf.gutter_bottom,
+                                leaf.gutter_left,
+                            ),
+                            _BspNode(
+                                best_x,
+                                leaf.y0,
+                                leaf.x1,
+                                leaf.y1,
+                                max(leaf.conf, best_sc),
+                                leaf.gutter_top,
+                                leaf.gutter_right,
+                                leaf.gutter_bottom,
+                                False,
+                            ),
+                        ]
                         propagated = True
-                        split_done = True
                         break
 
-            if not split_done:
-                next_leaves.append(leaf)
+    # 第四步：自底向上 BSP 几何尺寸与长宽比正则化，抑制卡片内部异常过切
+    _regularize_bsp_tree(root)
+    leaves = [node.to_raw_region() for node in root.collect_leaves()]
 
-        leaves = next_leaves
-
-    # 第四步：若背景平坦则过滤掉由纯背景色构成的空白区域
+    # 第五步：若背景平坦则过滤掉由纯背景色构成的空白区域
     if bg_uniform:
         non_empty = [
-            l for l in leaves if not _is_region_empty_bg(img, l.x0, l.y0, l.x1, l.y1, bg_rgb, is_trans, bg_noise)
+            lf for lf in leaves if not _is_region_empty_bg(img, lf.x0, lf.y0, lf.x1, lf.y1, bg_rgb, is_trans, bg_noise)
         ]
         final_leaves = non_empty if non_empty else leaves
     else:
         final_leaves = list(leaves)
 
-    # 第五步：采用视觉重叠行聚类按阅读顺序重排
-    grouped = _group_reading_order([(l.x0, l.y0, l.x1, l.y1, l) for l in final_leaves])
+    # 第六步：采用视觉重叠行聚类按阅读顺序重排
+    grouped = _group_reading_order([(lf.x0, lf.y0, lf.x1, lf.y1, lf) for lf in final_leaves])
 
-    # 第六步：对每个区域执行精细化对齐收边，构建最终 RawSplitBox 数据包
+    # 第七步：对每个区域执行精细化对齐收边，构建最终 RawSplitBox 数据包
     out: List[RawSplitBox] = []
     idx_counter = 1
     for cur_r, grp in enumerate(grouped):
@@ -1497,7 +2225,7 @@ def xy_cut_core(
                     y=ry0,
                     width=max(1, rx1 - rx0),
                     height=max(1, ry1 - ry0),
-                    confidence=min(1.0, leaf.conf / 150.0),
+                    confidence=min(1.0, leaf.conf / 36.0),
                     strategy="gutter" if leaf.is_gutter else "xycut",
                     trim_top=tt,
                     trim_right=tr,
@@ -1507,7 +2235,7 @@ def xy_cut_core(
             )
             idx_counter += 1
 
-    # 第七步：若开启诊断曲线采集，提取下采样投影能量曲线供前端可视化
+    # 第八步：若开启诊断曲线采集，提取下采样投影能量曲线供前端可视化
     curves_out: Optional[Dict[str, List[float]]] = None
     if collect_curves and top_curves is not None:
         curves_out = {}
@@ -1899,7 +2627,7 @@ def detect_auto_py(
             skip_contour = (
                 len(xy_boxes) >= 4
                 and (xy_area * 100) >= (total_area * 74)
-                and all(b.confidence >= 0.65 for b in xy_boxes)
+                and all(b.confidence >= 0.45 for b in xy_boxes)
             )
             if not skip_contour:
                 ct_boxes = contours_core(
