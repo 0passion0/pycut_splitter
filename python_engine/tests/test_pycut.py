@@ -27,7 +27,7 @@ from pycut_splitter import (
 
 def test_core_exports():
     assert HAS_OPENCV_CORE is True
-    assert __version__ == "1.3.0"
+    assert __version__ == "1.3.1"
     assert callable(SmartSplitter)
 
 
@@ -171,6 +171,89 @@ def test_grid_refine_requires_distributed_unambiguous_evidence():
     equal_boxes = SmartSplitter(mode="grid").analyze(gradient).boxes
     for image in (np.zeros_like(gradient), gradient, short_rule, cv2.GaussianBlur(double_peak, (0, 0), 3)):
         assert splitter.analyze(image).boxes == equal_boxes
+
+
+@pytest.mark.parametrize("sigma", [0, 2, 4])
+def test_grid_refine_staggered_slide_seams(sigma):
+    image = np.empty((1600, 2848, 3), dtype=np.uint8)
+    y_cuts = (0, 532, 1046, 1600)
+    x_cuts = [(0, 946, x, 2848) for x in (1825, 1823, 1812)]
+    colors = ((40, 210, 50), (213, 230, 201), (203, 227, 55))
+    expected = []
+    for row, (top, bottom) in enumerate(zip(y_cuts, y_cuts[1:])):
+        for col, (left, right) in enumerate(zip(x_cuts[row], x_cuts[row][1:])):
+            image[top:bottom, left:right] = colors[row][col]
+            expected.append((left, top, right, bottom))
+    image[600:650, 1915:2170] = 25
+    if sigma:
+        image = cv2.GaussianBlur(image, (0, 0), sigma)
+
+    splitter = SmartSplitter(mode="grid", grid_refine=True)
+    for transposed in (False, True):
+        source = image.swapaxes(0, 1) if transposed else image
+        boxes = splitter.analyze(source, rows=3, cols=3).boxes
+        assert len(boxes) == 9
+        coverage = np.zeros(source.shape[:2], dtype=np.uint8)
+        for box in boxes:
+            right, bottom = box.x + box.width, box.y + box.height
+            actual = (box.y, box.x, bottom, right) if transposed else (box.x, box.y, right, bottom)
+            index = box.col * 3 + box.row if transposed else box.row * 3 + box.col
+            assert actual == pytest.approx(expected[index], abs=2)
+            coverage[box.y:bottom, box.x:right] += 1
+        assert np.all(coverage == 1)
+
+
+@pytest.mark.parametrize("height,width,cols,shift", [(319, 1801, 4, 0.30), (443, 1200, 3, 0.44)])
+@pytest.mark.parametrize("sigma", [0, 3, 8])
+def test_grid_refine_finds_large_moves_in_single_row(height, width, cols, shift, sigma):
+    cell = width / cols
+    cuts = [round(cell * (i + (-1) ** i * shift)) for i in range(1, cols)]
+    image = np.full((height, width, 3), 45, dtype=np.uint8)
+    for x in cuts:
+        image[:, x:] += 35
+    image[height // 3:height // 2, round(cell * 0.85):round(cell * 1.1)] = 240
+    if sigma:
+        image = cv2.GaussianBlur(image, (0, 0), sigma)
+
+    splitter = SmartSplitter(mode="grid", grid_refine=True)
+    boxes = splitter.analyze(image, rows=1, cols=cols).boxes
+    assert [box.x for box in boxes[1:]] == pytest.approx(cuts, abs=1)
+    boxes = splitter.analyze(image.swapaxes(0, 1), rows=cols, cols=1).boxes
+    assert [box.y for box in boxes[1:]] == pytest.approx(cuts, abs=1)
+
+
+@pytest.mark.parametrize("sigma", [0, 8])
+def test_grid_refine_preserves_aligned_partial_seam_over_strong_wavy_edge(sigma):
+    y, x = np.indices((512, 720))
+    content_edge = 159 + 8 * np.sin(x * 6 * np.pi / x.shape[1])
+    gray = 40 + 125 * (y >= content_edge) + 40 * ((y >= 256) & (x >= 418))
+    image = np.repeat(gray.astype(np.uint8)[..., None], 3, axis=2)
+    if sigma:
+        image = cv2.GaussianBlur(image, (0, 0), sigma)
+    boxes = SmartSplitter(mode="grid", grid_refine=True).analyze(image, rows=2, cols=1).boxes
+    assert boxes[1].y == 256
+
+
+@pytest.mark.parametrize("width,height,offsets", [(780, 610, (-109, 16, 100)), (800, 420, (0, 75, 125))])
+@pytest.mark.parametrize("sigma", [0, 8])
+def test_grid_refine_finds_large_staggered_moves(width, height, offsets, sigma):
+    image = np.empty((height, width, 3), dtype=np.uint8)
+    ys = [round(i * height / len(offsets)) for i in range(len(offsets) + 1)]
+    xs = [width // 2 + offset for offset in offsets]
+    for row, x in enumerate(xs):
+        top, bottom = ys[row:row + 2]
+        image[top:bottom, :x] = (20 + row * 20, 30 + row * 25, 100 + row * 40)
+        image[top:bottom, x:] = (140 + row * 20, 100 + row * 25, 30 + row * 40)
+    if sigma:
+        image = cv2.GaussianBlur(image, (0, 0), sigma)
+
+    boxes = SmartSplitter(mode="grid", grid_refine=True).analyze(image, rows=len(offsets), cols=2).boxes
+    assert len(boxes) == 2 * len(offsets)
+    for row, (left, right) in enumerate(zip(boxes[::2], boxes[1::2])):
+        assert left.x + left.width == right.x == pytest.approx(xs[row], abs=1)
+        assert right.x + right.width == width
+        assert left.y == right.y == ys[row]
+        assert left.y + left.height == right.y + right.height == ys[row + 1]
 
 
 def test_grid_refine_uses_alpha_and_ignores_invisible_rgb():

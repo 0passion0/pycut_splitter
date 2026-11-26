@@ -2482,12 +2482,20 @@ def _grid_seam_profile(strip: np.ndarray, lo: int, hi: int) -> np.ndarray:
     if band.shape[0] > 160:
         band = cv2.resize(band, (band.shape[1], 160), interpolation=cv2.INTER_AREA)
 
-    sums = np.pad(np.cumsum(band, axis=1, dtype=np.int32), ((0, 0), (1, 0), (0, 0)))
-    points = np.arange(margin, margin + hi - lo + 1)
+    return _grid_band_profiles(band, _GRID_SEAM_BANDS)
+
+
+def _grid_band_profiles(band: np.ndarray, widths: Tuple[int, ...]) -> np.ndarray:
+    margin = widths[-1]
+    channels = np.ascontiguousarray(band.transpose(2, 0, 1))
+    sums = np.pad(np.cumsum(channels, axis=2, dtype=np.int32), ((0, 0), (0, 0), (1, 0)))
+    end = band.shape[1] - margin + 1
+    center = 2 * sums[:, :, margin:end]
     profiles = []
-    for width in _GRID_SEAM_BANDS:
-        difference = sums[:, points + width] - 2 * sums[:, points] + sums[:, points - width]
-        profiles.append(np.minimum(np.abs(difference).max(axis=2) / width, 32))
+    for width in widths:
+        difference = sums[:, :, margin + width:end + width] - center + sums[:, :, margin - width:end - width]
+        contrast = np.divide(np.abs(difference).max(axis=0), width, dtype=np.float32)
+        profiles.append(np.minimum(contrast, 128 if width == 1 else 32))
     return np.stack(profiles)
 
 
@@ -2503,11 +2511,10 @@ def _refine_grid_axis(strip: np.ndarray, cuts: List[int], gutter: int) -> List[i
         raise ValueError("Grid rows, columns and gutter must leave at least one pixel in every tile.")
 
     margin = _GRID_SEAM_BANDS[-1]
-    max_radius = min(48, max(2, round(0.08 * cuts[-1] / (len(cuts) - 1))))
     refined = cuts.copy()
     for i, anchor in enumerate(cuts[1:-1], start=1):
-        # A tile can have both adjacent cuts move toward its center.
-        radius = min(max_radius, slack[i - 1] // 2, slack[i] // 2)
+        # Reserve half the free space for each neighboring divider, including gutter insets.
+        radius = min(slack[i - 1] // 2, slack[i] // 2)
         lo = max(anchor - radius, margin + end_inset)
         hi = min(anchor + radius, cuts[-1] - margin - start_inset)
         if lo == hi or not lo <= anchor <= hi:
@@ -2517,20 +2524,42 @@ def _refine_grid_axis(strip: np.ndarray, cuts: List[int], gutter: int) -> List[i
         if gutter:
             scales = np.minimum(scales, _grid_seam_profile(strip, lo + start_inset, hi + start_inset))
         evidence = 0.25 * scales[0] + 0.35 * scales[1] + 0.40 * scales[2]
-        scores = evidence.mean(axis=0)
+        scores = evidence.mean(axis=0) + np.quantile(evidence, 0.25, axis=0)
         points = np.arange(lo, hi + 1)
         offsets = np.abs(points - anchor)
         adjusted = scores - 0.8 * offsets / radius
         best = int(np.lexsort((offsets, -adjusted))[0])
+        contrast_threshold = np.median(evidence, axis=1) + 1
+
+        def peak_coverage(candidate: int) -> float:
+            neighborhood = evidence[:, max(0, candidate - margin):candidate + margin + 1]
+            center = evidence[:, max(0, candidate - 2):candidate + 3].max(axis=1)
+            return np.mean((center >= np.maximum(3, contrast_threshold)) & (center == neighborhood.max(axis=1)))
+
+        if offsets[best] > margin and peak_coverage(best) < 0.60:
+            # A nearby aligned peak can outweigh a stronger edge with scattered peak positions.
+            nearby = np.flatnonzero(offsets <= margin)
+            if any(peak_coverage(candidate) >= 0.30 for candidate in nearby):
+                continue
+
         min_score = max(2.0, np.median(scores) + 0.8)
         min_gain = scores[anchor - lo] + 0.4
         if scores[best] < min_score or adjusted[best] < min_gain:
             continue
 
-        support_threshold = np.maximum(3, np.median(evidence, axis=1) + 1)
+        support_threshold = np.maximum(3, contrast_threshold)
 
         def has_span(candidate: int) -> bool:
-            support = np.flatnonzero(evidence[:, candidate] >= support_threshold)
+            along_cut = evidence[:, candidate]
+            weak_support = along_cut >= np.maximum(2, contrast_threshold)
+            edge_span = (len(evidence) + 2) // 3
+            if (
+                np.mean(weak_support) >= 2 / 3
+                or weak_support[:edge_span].all()
+                or weak_support[-edge_span:].all()
+            ):
+                return True
+            support = np.flatnonzero(along_cut >= support_threshold)
             if len(support) < 0.25 * len(evidence):
                 return False
             low, high = np.quantile(support, (0.1, 0.9))
@@ -2544,13 +2573,71 @@ def _refine_grid_axis(strip: np.ndarray, cuts: List[int], gutter: int) -> List[i
         )
         rivals = np.flatnonzero(
             peaks
-            & (np.abs(points - points[best]) > max(6, (radius + 1) // 2))
+            & (np.abs(points - points[best]) > margin)
             & (scores >= min_score)
             & (adjusted >= max(min_gain, 0.9 * adjusted[best]))
         )
         if not any(has_span(rival) for rival in rivals):
             refined[i] = lo + best
     return refined
+
+
+def _refine_grid_segments(strip: np.ndarray, cuts: List[int], cross_cuts: List[int]) -> Tuple[List[List[int]], int]:
+    segmented = [cuts.copy() for _ in cross_cuts[1:]]
+    max_spread = 0
+    # Sample inside each panel, away from T-junctions where neighboring cuts can cross.
+    sample_fractions = np.linspace(0.08, 0.92, min(32, 160 // len(segmented)))
+    samples = (np.asarray(cross_cuts[:-1])[:, None] + np.diff(cross_cuts)[:, None] * sample_fractions).astype(int)
+    margin = _GRID_SEAM_BANDS[-1]
+    for i, anchor in enumerate(cuts[1:-1], start=1):
+        radius = min(
+            (anchor - cuts[i - 1] - 1) // 2, (cuts[i + 1] - anchor - 1) // 2,
+            anchor - margin, cuts[-1] - margin - anchor,
+        )
+        if radius < 2:
+            continue
+        band = strip[samples.ravel(), anchor - radius - margin:anchor + radius + margin]
+        if band.shape[2] == 4:
+            band = cv2.cvtColor(band, cv2.COLOR_RGBA2mRGBA)
+        sharp, small, mid, wide = _grid_band_profiles(band, (1, *_GRID_SEAM_BANDS))
+        edges = 0.5 * sharp + 0.25 * small + 0.35 * mid + 0.40 * wide
+        edges = edges.reshape(len(segmented), len(sample_fractions), -1)
+        profiles = np.quantile(edges, 0.25, axis=1)
+        supported = []
+        distant = []
+        offsets = np.abs(np.arange(-radius, radius + 1))
+        near = np.flatnonzero(offsets <= 2 * margin)
+        for segment, profile in enumerate(profiles):
+            adjusted = profile - 0.8 * offsets / radius
+            baseline = np.median(profile) + 1
+            best_near = near[np.argmax(adjusted[near])]
+            other_near = near[np.abs(near - best_near) > margin]
+            if (
+                profile[best_near] >= max(2, baseline)
+                and offsets[best_near] < 2 * margin
+                and adjusted[other_near].max(initial=0) < 0.9 * adjusted[best_near]
+            ):
+                supported.append((segment, anchor - radius + int(best_near)))
+                continue
+            best = int(np.argmax(adjusted))
+            rival = adjusted[np.abs(np.arange(len(profile)) - best) > margin].max(initial=0)
+            if profile[best] >= max(3, baseline) and rival < 0.9 * adjusted[best]:
+                along_cut = edges[segment]
+                support = along_cut[:, best] >= np.maximum(3, np.median(along_cut, axis=1) + 1)
+                if np.mean(support) >= 0.9:
+                    distant.append((segment, anchor - radius + best))
+        # A lone distant edge can be a rule inside a panel. Look for displacement in multiple bands.
+        if len(distant) >= 2:
+            supported.extend(distant)
+        if len(supported) < 2:
+            continue
+        positions = [position for _, position in supported]
+        spread = max(positions) - min(positions)
+        if spread >= 3:
+            max_spread = max(max_spread, spread)
+            for segment, position in supported:
+                segmented[segment][i] = position
+    return segmented, max_spread
 
 
 def uniform_grid_core(
@@ -2587,15 +2674,26 @@ def uniform_grid_core(
         x_cuts = _refine_grid_axis(refine_image, x_cuts, g)
         y_cuts = _refine_grid_axis(refine_image.swapaxes(0, 1), y_cuts, g)
 
+    x_by_row = [x_cuts] * r_cnt
+    y_by_col = [y_cuts] * c_cnt
+    if refine_image is not None and not g and r_cnt > 1 and c_cnt > 1:
+        x_segments, x_spread = _refine_grid_segments(refine_image, x_cuts, y_cuts)
+        y_segments, y_spread = _refine_grid_segments(refine_image.swapaxes(0, 1), y_cuts, x_cuts)
+        # Use one set of shared dividers to avoid gaps and overlaps at intersections.
+        if x_spread >= y_spread:
+            x_by_row = x_segments
+        else:
+            y_by_col = y_segments
+
     # 第二步：遍历行列生成等比矩形切片并执行 gutter 缝隙收缩
     boxes: List[RawSplitBox] = []
     idx = 1
     for r in range(r_cnt):
-        y0 = y_cuts[r] + (half_g if r > 0 else 0)
-        y1 = y_cuts[r + 1] - ((g - half_g) if r < r_cnt - 1 else 0)
         for c in range(c_cnt):
-            x0 = x_cuts[c] + (half_g if c > 0 else 0)
-            x1 = x_cuts[c + 1] - ((g - half_g) if c < c_cnt - 1 else 0)
+            x0 = x_by_row[r][c] + (half_g if c > 0 else 0)
+            x1 = x_by_row[r][c + 1] - ((g - half_g) if c < c_cnt - 1 else 0)
+            y0 = y_by_col[c][r] + (half_g if r > 0 else 0)
+            y1 = y_by_col[c][r + 1] - ((g - half_g) if r < r_cnt - 1 else 0)
             boxes.append(
                 RawSplitBox(
                     index=idx,
