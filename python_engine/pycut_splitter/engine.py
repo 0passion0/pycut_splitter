@@ -94,6 +94,8 @@ class SmartSplitter:
         uniform_mode: UniformMode = "pad",
         max_pixels: int = DEFAULT_MAX_PIXELS,
         max_workers: Optional[int] = None,
+        *,
+        grid_refine: bool = False,
     ) -> None:
         """
         初始化智能图像切分器实例。
@@ -120,6 +122,7 @@ class SmartSplitter:
         :type max_pixels: int
         :param max_workers: 批量切片导出与保存时的线程池最大工作线程数，默认根据 CPU 核心数自适应。
         :type max_workers: Optional[int]
+        :param grid_refine: 在网格模式下根据接缝证据微调等分线，默认关闭。
         :raises ValueError: 当 uniform_mode 不在有效模式中，或 target_size 的高宽非正数时抛出。
         :author: tongliga
         :date: 2026-11-18
@@ -144,6 +147,7 @@ class SmartSplitter:
         self.uniform_mode: UniformMode = uniform_mode
         self.max_pixels = max_pixels
         self.max_workers = max_workers
+        self.grid_refine = grid_refine
 
     def analyze(
         self,
@@ -217,6 +221,7 @@ class SmartSplitter:
             target_size=self.target_size,
             uniform_mode=self.uniform_mode,
             collect_diagnostics=collect_diagnostics,
+            grid_refine=self.grid_refine,
         )
 
         # 第四步：封装并转换原始检测框为标准公共契约对象

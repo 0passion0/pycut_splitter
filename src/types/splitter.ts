@@ -57,6 +57,7 @@ export interface AnalyzeParams {
   rows: number;
   cols: number;
   gutterPx: number;
+  gridRefine: boolean;
   uniformSize: boolean;
   uniformMode: UniformMode;
   targetWidth: string;

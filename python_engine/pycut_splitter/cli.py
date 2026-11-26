@@ -70,6 +70,7 @@ def main() -> None:
     parser.add_argument("--rows", type=int, default=3, help="Grid rows")
     parser.add_argument("--cols", type=int, default=3, help="Grid columns")
     parser.add_argument("--gutter-px", type=int, default=0, help="Grid gutter pixels")
+    parser.add_argument("--grid-refine", action="store_true", help="Refine cut positions in grid mode")
     parser.add_argument("--format", default="png", choices=["png", "jpg", "webp"], help="Output image format")
     parser.add_argument("--uniform-size", action="store_true", help="Normalize all slices to uniform dimensions")
     parser.add_argument("--target-size", default=None, help="Explicit uniform size WIDTHxHEIGHT, e.g. 512x512")
@@ -93,6 +94,7 @@ def main() -> None:
         uniform_size=args.uniform_size,
         target_size=parsed_target_size,
         uniform_mode=args.uniform_mode,
+        grid_refine=args.grid_refine,
     )
 
     # 第三步：收集目标输入文件列表（支持单个文件或目录批处理）

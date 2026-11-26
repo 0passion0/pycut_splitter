@@ -136,6 +136,11 @@ async function createServer() {
       const preset = typeof body.preset === 'string' ? body.preset : undefined;
       const imageBase64 = typeof body.imageBase64 === 'string' ? body.imageBase64 : undefined;
 
+      if (Object.hasOwn(body, 'gridRefine') && typeof body.gridRefine !== 'boolean') {
+        res.status(400).json({ error: 'gridRefine must be a boolean.' });
+        return;
+      }
+
       if (!preset && !imageBase64) {
         res.status(400).json({ error: 'Provide either preset or imageBase64.' });
         return;
@@ -159,6 +164,10 @@ async function createServer() {
         includeTiles: body.includeTiles !== false,
         includeSourcePreview: Boolean(body.includeSourcePreview),
       };
+
+      if (Object.hasOwn(body, 'gridRefine')) {
+        payload.gridRefine = body.gridRefine;
+      }
 
       if (imageBase64) {
         payload.imageBase64 = imageBase64;

@@ -2,6 +2,12 @@
 
 本项目遵循 [语义化版本控制（Semantic Versioning）](https://semver.org/lang/zh-CN/)。
 
+## [1.3.0] - 2026-11-26
+
+- 网格模式新增「自动微调切线」。指定行列数后，程序从等分位置出发，用多尺度条带定位模糊或低对比度接缝。证据不足时保留等分坐标。
+- 微调默认关闭。可通过界面开关、CLI `--grid-refine`、Python `SmartSplitter(mode="grid", grid_refine=True)` 或 HTTP `gridRefine` 启用。
+- 新增弱边界、透明接缝、奇偶留白和微调后统一尺寸导出的回归测试。
+
 ## [1.2.0] - 2026-11-25
 
 ### 核心架构深度优化

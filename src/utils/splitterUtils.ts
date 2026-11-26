@@ -65,6 +65,10 @@ export function generatePythonSnippet(params: AnalyzeParams, sourceName: string)
     `    contour_gap_px=${params.contourGapPx},`,
   ];
 
+  if (params.mode === 'grid' && params.gridRefine) {
+    lines.push('    grid_refine=True,');
+  }
+
   const { valid, targetWidthNum, targetHeightNum } = validateUniformTarget(
     params.uniformSize,
     params.targetWidth,

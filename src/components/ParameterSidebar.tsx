@@ -183,6 +183,15 @@ export function ParameterSidebar({
                 />
               </label>
             </div>
+            <label className="mt-3 flex items-center gap-2 text-xs font-medium text-slate-700">
+              <input
+                type="checkbox"
+                checked={params.gridRefine}
+                onChange={(e) => onUpdateParams({ gridRefine: e.target.checked })}
+                className="accent-blue-600"
+              />
+              自动微调切线
+            </label>
           </section>
         ) : (
           <section className="space-y-4 p-5">

@@ -142,6 +142,10 @@ def _handle_analyze(req: Dict[str, Any]) -> Dict[str, Any]:
     :author: tongliga
     :date: 2026-11-18
     """
+    grid_refine = req.get("gridRefine", False)
+    if not isinstance(grid_refine, bool):
+        raise ValueError("gridRefine must be a boolean.")
+
     # 第一步：根据请求源解析输入图像为标准 NumPy 矩阵
     preset = req.get("preset")
     image_b64 = req.get("imageBase64")
@@ -172,6 +176,7 @@ def _handle_analyze(req: Dict[str, Any]) -> Dict[str, Any]:
         uniform_size=bool(req.get("uniformSize", False)),
         target_size=target_size,
         uniform_mode=str(req.get("uniformMode", "pad")),
+        grid_refine=grid_refine,
     )
 
     rows = int(req.get("rows", 3))

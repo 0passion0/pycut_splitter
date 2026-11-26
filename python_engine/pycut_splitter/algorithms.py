@@ -2471,7 +2471,91 @@ def contours_core(
     return boxes
 
 
-def uniform_grid_core(w: int, h: int, rows: int, cols: int, gutter_px: int) -> List[RawSplitBox]:
+_GRID_SEAM_BANDS = (2, 6, 12)
+
+
+def _grid_seam_profile(strip: np.ndarray, lo: int, hi: int) -> np.ndarray:
+    margin = _GRID_SEAM_BANDS[-1]
+    band = strip[:, lo - margin:hi + margin]
+    if band.shape[2] == 4:
+        band = cv2.cvtColor(band, cv2.COLOR_RGBA2mRGBA)
+    if band.shape[0] > 160:
+        band = cv2.resize(band, (band.shape[1], 160), interpolation=cv2.INTER_AREA)
+
+    sums = np.pad(np.cumsum(band, axis=1, dtype=np.int32), ((0, 0), (1, 0), (0, 0)))
+    points = np.arange(margin, margin + hi - lo + 1)
+    profiles = []
+    for width in _GRID_SEAM_BANDS:
+        difference = sums[:, points + width] - 2 * sums[:, points] + sums[:, points - width]
+        profiles.append(np.minimum(np.abs(difference).max(axis=2) / width, 32))
+    return np.stack(profiles)
+
+
+def _refine_grid_axis(strip: np.ndarray, cuts: List[int], gutter: int) -> List[int]:
+    end_inset = (gutter + 1) // 2
+    start_inset = gutter // 2
+    last_cell = len(cuts) - 2
+    slack = [
+        end - start - (start_inset if i else 0) - (end_inset if i < last_cell else 0) - 1
+        for i, (start, end) in enumerate(zip(cuts, cuts[1:]))
+    ]
+    if min(slack) < 0:
+        raise ValueError("Grid rows, columns and gutter must leave at least one pixel in every tile.")
+
+    margin = _GRID_SEAM_BANDS[-1]
+    max_radius = min(48, max(2, round(0.08 * cuts[-1] / (len(cuts) - 1))))
+    refined = cuts.copy()
+    for i, anchor in enumerate(cuts[1:-1], start=1):
+        # A tile can have both adjacent cuts move toward its center.
+        radius = min(max_radius, slack[i - 1] // 2, slack[i] // 2)
+        lo = max(anchor - radius, margin + end_inset)
+        hi = min(anchor + radius, cuts[-1] - margin - start_inset)
+        if lo == hi or not lo <= anchor <= hi:
+            continue
+
+        scales = _grid_seam_profile(strip, lo - end_inset, hi - end_inset)
+        if gutter:
+            scales = np.minimum(scales, _grid_seam_profile(strip, lo + start_inset, hi + start_inset))
+        evidence = 0.25 * scales[0] + 0.35 * scales[1] + 0.40 * scales[2]
+        scores = evidence.mean(axis=0)
+        points = np.arange(lo, hi + 1)
+        offsets = np.abs(points - anchor)
+        adjusted = scores - 0.8 * offsets / radius
+        best = int(np.lexsort((offsets, -adjusted))[0])
+        min_score = max(2.0, np.median(scores) + 0.8)
+        min_gain = scores[anchor - lo] + 0.4
+        if scores[best] < min_score or adjusted[best] < min_gain:
+            continue
+
+        support_threshold = np.maximum(3, np.median(evidence, axis=1) + 1)
+
+        def has_span(candidate: int) -> bool:
+            support = np.flatnonzero(evidence[:, candidate] >= support_threshold)
+            if len(support) < 0.25 * len(evidence):
+                return False
+            low, high = np.quantile(support, (0.1, 0.9))
+            return high - low >= 0.46 * len(evidence)
+
+        if not has_span(best):
+            continue
+        # shortcut: close peaks count as one, revisit if narrow gutters pull cuts off center.
+        peaks = (adjusted >= np.r_[-np.inf, adjusted[:-1]]) & (
+            adjusted >= np.r_[adjusted[1:], -np.inf]
+        )
+        rivals = np.flatnonzero(
+            peaks
+            & (np.abs(points - points[best]) > max(6, (radius + 1) // 2))
+            & (scores >= min_score)
+            & (adjusted >= max(min_gain, 0.9 * adjusted[best]))
+        )
+        if not any(has_span(rival) for rival in rivals):
+            refined[i] = lo + best
+    return refined
+
+
+def uniform_grid_core(
+    w: int, h: int, rows: int, cols: int, gutter_px: int, *, refine_image: Optional[np.ndarray] = None
+) -> List[RawSplitBox]:
     """
     按指定的固定行数与列数执行几何均匀九宫格/网格切分算子。
 
@@ -2497,16 +2581,21 @@ def uniform_grid_core(w: int, h: int, rows: int, cols: int, gutter_px: int) -> L
     c_cnt = max(1, min(20, int(cols)))
     g = max(0, int(gutter_px))
     half_g = g // 2
+    x_cuts = [round(i * w / float(c_cnt)) for i in range(c_cnt + 1)]
+    y_cuts = [round(i * h / float(r_cnt)) for i in range(r_cnt + 1)]
+    if refine_image is not None:
+        x_cuts = _refine_grid_axis(refine_image, x_cuts, g)
+        y_cuts = _refine_grid_axis(refine_image.swapaxes(0, 1), y_cuts, g)
 
     # 第二步：遍历行列生成等比矩形切片并执行 gutter 缝隙收缩
     boxes: List[RawSplitBox] = []
     idx = 1
     for r in range(r_cnt):
-        y0 = int(round((r * h) / float(r_cnt))) + (half_g if r > 0 else 0)
-        y1 = int(round(((r + 1) * h) / float(r_cnt))) - ((g - half_g) if r < r_cnt - 1 else 0)
+        y0 = y_cuts[r] + (half_g if r > 0 else 0)
+        y1 = y_cuts[r + 1] - ((g - half_g) if r < r_cnt - 1 else 0)
         for c in range(c_cnt):
-            x0 = int(round((c * w) / float(c_cnt))) + (half_g if c > 0 else 0)
-            x1 = int(round(((c + 1) * w) / float(c_cnt))) - ((g - half_g) if c < c_cnt - 1 else 0)
+            x0 = x_cuts[c] + (half_g if c > 0 else 0)
+            x1 = x_cuts[c + 1] - ((g - half_g) if c < c_cnt - 1 else 0)
             boxes.append(
                 RawSplitBox(
                     index=idx,
@@ -2538,6 +2627,8 @@ def detect_auto_py(
     target_size: Optional[Tuple[int, int]] = None,
     uniform_mode: str = "pad",
     collect_diagnostics: bool = False,
+    *,
+    grid_refine: bool = False,
 ) -> Tuple[str, List[RawSplitBox], Optional[Dict[str, object]]]:
     """
     智能图像自动切分核心调度入口（支持 auto/xycut/contour/grid 策略）。
@@ -2574,6 +2665,7 @@ def detect_auto_py(
     :type uniform_mode: str
     :param collect_diagnostics: 是否收集背景诊断参数与投影曲线数据，默认为 False。
     :type collect_diagnostics: bool
+    :param grid_refine: 是否在网格模式下微调内部接缝，默认关闭。
     :return: 包含最终采用策略名称、检测出的切片框列表与诊断信息字典的三元组：(detected_mode, boxes, diag)。
     :raises ValueError: 当 uniform_mode 非法或 target_size 宽高不为正整数时抛出。
     :author: tongliga
@@ -2600,7 +2692,7 @@ def detect_auto_py(
     # 第三步：依据请求模式执行对应的分割算法内核
     if mode_lower == "grid":
         detected_mode = "grid"
-        boxes = uniform_grid_core(w, h, rows, cols, gutter_px)
+        boxes = uniform_grid_core(w, h, rows, cols, gutter_px, refine_image=img if grid_refine else None)
     elif mode_lower == "contour":
         detected_mode = "contour"
         boxes = contours_core(img, sensitivity, min_region_ratio, contour_gap_px, bg_rgb, is_trans, bg_noise=bg_noise)

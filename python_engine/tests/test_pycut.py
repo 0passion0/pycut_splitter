@@ -8,6 +8,7 @@ import tracemalloc
 from io import BytesIO
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 from PIL import Image
@@ -26,7 +27,7 @@ from pycut_splitter import (
 
 def test_core_exports():
     assert HAS_OPENCV_CORE is True
-    assert __version__ == "1.2.0"
+    assert __version__ == "1.3.0"
     assert callable(SmartSplitter)
 
 
@@ -131,6 +132,105 @@ def test_grid_and_ml_hook_and_split_file():
         assert len(saved) == 4
         assert all(Path(p).exists() for p in saved)
         assert len(res_f.boxes) == 4
+
+
+def test_grid_refine_weak_blurred_jpeg_seams():
+    y, x = np.indices((401, 601))
+    image = np.repeat((95 + 0.02 * x + 0.01 * y).astype(np.uint8)[..., None], 3, axis=2)
+    image[:, 208:] += 8
+    image[:, 394:] += 8
+    image[191:] += 8
+    image = cv2.GaussianBlur(image, (0, 0), 6)
+    noise = np.random.default_rng(9517).normal(0, 1.2, image.shape)
+    image = np.clip(image + noise, 0, 255).astype(np.uint8)
+    _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    image = cv2.imdecode(jpeg, cv2.IMREAD_COLOR)
+
+    plain = SmartSplitter(mode="grid").analyze(image, rows=2, cols=3)
+    refined = SmartSplitter(mode="grid", grid_refine=True).analyze(image, rows=2, cols=3)
+    assert [b.x for b in plain.boxes[:3]] == [0, 200, 401]
+    assert refined.detected_mode == "grid"
+    assert [(b.index, b.row, b.col, b.strategy) for b in refined.boxes] == [
+        (b.index, b.row, b.col, b.strategy) for b in plain.boxes
+    ]
+    assert abs(refined.boxes[1].x - 208) <= 2
+    assert abs(refined.boxes[2].x - 394) <= 2
+    assert abs(refined.boxes[3].y - 191) <= 2
+    assert sum(b.width * b.height for b in refined.boxes) == 401 * 601
+
+
+def test_grid_refine_requires_distributed_unambiguous_evidence():
+    y, x = np.indices((401, 601))
+    gradient = np.repeat((95 + 0.02 * x + 0.01 * y).astype(np.uint8)[..., None], 3, axis=2)
+    short_rule = gradient.copy()
+    short_rule[75:155, 208:213] = 240
+    double_peak = gradient.copy()
+    double_peak[126:] += 8
+    double_peak[140:] += 8
+    splitter = SmartSplitter(mode="grid", grid_refine=True)
+    equal_boxes = SmartSplitter(mode="grid").analyze(gradient).boxes
+    for image in (np.zeros_like(gradient), gradient, short_rule, cv2.GaussianBlur(double_peak, (0, 0), 3)):
+        assert splitter.analyze(image).boxes == equal_boxes
+
+
+def test_grid_refine_uses_alpha_and_ignores_invisible_rgb():
+    image = np.full((401, 601, 4), 120, dtype=np.uint8)
+    image[:, :288, 3] = 0
+    image[:, 288:, 3] = 255
+    image = cv2.GaussianBlur(image, (0, 0), 5)
+    splitter = SmartSplitter(mode="grid", grid_refine=True)
+    assert abs(splitter.analyze(image, rows=1, cols=2).boxes[1].x - 288) <= 3
+
+    image[..., 3] = 0
+    image[:, 288:, :3] = 255
+    assert splitter.analyze(image, rows=1, cols=2).boxes[1].x == round(601 / 2)
+
+
+@pytest.mark.parametrize("gutter", [8, 9])
+@pytest.mark.parametrize("sigma", [0, 2])
+def test_grid_refine_centers_gutter_and_keeps_its_width(gutter, sigma):
+    xs, ys = (0, 468, 899, 1367), (0, 244, 526, 768)
+    image = np.full((ys[-1], xs[-1], 3), 225, dtype=np.uint8)
+    start, end = gutter // 2, (gutter + 1) // 2
+    for r in range(3):
+        for c in range(3):
+            image[
+                ys[r] + (start if r else 0):ys[r + 1] - (end if r < 2 else 0),
+                xs[c] + (start if c else 0):xs[c + 1] - (end if c < 2 else 0),
+            ] = 25 + (r * 3 + c) * 17
+    if sigma:
+        image = cv2.GaussianBlur(image, (0, 0), sigma)
+    boxes = SmartSplitter(mode="grid", grid_refine=True).analyze(image, gutter_px=gutter).boxes
+    for i in (1, 2):
+        assert abs(boxes[i].x - start - xs[i]) <= 1
+        assert abs(boxes[3 * i].y - start - ys[i]) <= 1
+        assert boxes[i].x - (boxes[i - 1].x + boxes[i - 1].width) == gutter
+        assert boxes[3 * i].y - (boxes[3 * (i - 1)].y + boxes[3 * (i - 1)].height) == gutter
+    assert (boxes[0].x, boxes[0].y) == (0, 0)
+    assert (boxes[-1].x + boxes[-1].width, boxes[-1].y + boxes[-1].height) == (xs[-1], ys[-1])
+
+
+@pytest.mark.parametrize("uniform_mode", ["pad", "resize", "crop"])
+def test_grid_refine_uniform_export(uniform_mode):
+    image = np.zeros((101, 201, 3), dtype=np.uint8)
+    image[:, 93:] = 120
+    splitter = SmartSplitter(mode="grid", grid_refine=True, target_size=(80, 80), uniform_mode=uniform_mode)
+    result, blobs = splitter.split_to_bytes(image, rows=1, cols=2)
+    assert len(result.boxes) == len(blobs) == 2
+    assert all(Image.open(BytesIO(blob)).size == (80, 80) for blob in blobs)
+
+
+def test_grid_refine_validates_geometry_before_writing(tmp_path):
+    source = tmp_path / "tiny.png"
+    output = tmp_path / "tiles"
+    Image.new("RGB", (3, 2)).save(source)
+    splitter = SmartSplitter(mode="grid", grid_refine=True)
+    for rows, cols, gutter in ((3, 1, 0), (1, 3, 1)):
+        with pytest.raises(ValueError, match="at least one pixel"):
+            splitter.split_file(source, output, rows=rows, cols=cols, gutter_px=gutter)
+    assert not output.exists()
+    result = splitter.analyze(np.zeros((2, 3, 3), dtype=np.uint8), rows=1, cols=1, gutter_px=9)
+    assert [(b.x, b.y, b.width, b.height) for b in result.boxes] == [(0, 0, 3, 2)]
 
 
 def test_rgba_transparency_and_low_level_apis():

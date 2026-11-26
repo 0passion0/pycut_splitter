@@ -39,6 +39,7 @@ test('generatePythonSnippet reflects uniform sizing and grid params', () => {
     rows: 3,
     cols: 3,
     gutterPx: 12,
+    gridRefine: false,
     uniformSize: true,
     uniformMode: 'resize',
     targetWidth: '400',
@@ -50,6 +51,11 @@ test('generatePythonSnippet reflects uniform sizing and grid params', () => {
   assert.ok(code.includes('uniform_mode="resize"'));
   assert.ok(code.includes('target_size=(400, 300)'));
   assert.ok(code.includes('rows=3, cols=3, gutter_px=12'));
+  assert.ok(!code.includes('grid_refine='));
+  assert.ok(generatePythonSnippet({ ...params, gridRefine: true }, 'board.png').includes('grid_refine=True'));
+  for (const mode of ['auto', 'xycut', 'contour'] as const) {
+    assert.ok(!generatePythonSnippet({ ...params, mode, gridRefine: true }, 'board.png').includes('grid_refine='));
+  }
 });
 
 test('formatBoxMeta and summarizeBenchmark compute accurate metrics', () => {
